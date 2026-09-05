@@ -62,6 +62,7 @@ import org.openani.mediamp.exoplayer.internal.ExoFramePreview
 import org.openani.mediamp.exoplayer.internal.SeekableInputDataSource
 import org.openani.mediamp.exoplayer.internal.WsolaRenderersFactory
 import org.openani.mediamp.exoplayer.internal.toPlaybackException
+import org.openani.mediamp.exoplayer.internal.videoDisplaySizeOrNull
 import org.openani.mediamp.features.AspectRatioMode
 import org.openani.mediamp.features.Buffering
 import org.openani.mediamp.features.FramePreview
@@ -82,7 +83,6 @@ import org.openani.mediamp.source.SeekableInputMediaData
 import org.openani.mediamp.source.UriMediaData
 import kotlin.concurrent.Volatile
 import kotlin.coroutines.CoroutineContext
-import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
 import androidx.media3.common.PlaybackException as Media3PlaybackException
 import androidx.media3.common.Player as Media3Player
@@ -622,12 +622,12 @@ public class ExoPlayerMediampPlayer @UiThread public constructor(
      */
     @MainThread
     private fun readMediaProperties(): MediaProperties {
-        val videoSize = exoPlayer.videoSize
+        val displaySize = exoPlayer.videoDisplaySizeOrNull()
         return MediaProperties(
             title = exoPlayer.mediaMetadata.title?.toString(),
             durationMillis = exoPlayer.duration.takeIf { it != C.TIME_UNSET && it >= 0 },
-            videoWidth = (videoSize.width * videoSize.pixelWidthHeightRatio).roundToInt().takeIf { it > 0 },
-            videoHeight = videoSize.height.takeIf { it > 0 },
+            videoWidth = displaySize?.width,
+            videoHeight = displaySize?.height,
         )
     }
 
