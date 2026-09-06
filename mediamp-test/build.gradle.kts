@@ -21,6 +21,8 @@ kotlin {
     explicitApi()
     wasmJs {
         browser()
+        // Compose UI tests need webpack to bundle the Skiko runtime.
+        binaries.executable()
     }
     androidLibrary {
         namespace = "org.openani.mediamp.test"
