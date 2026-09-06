@@ -49,6 +49,9 @@ The desktop MPV backend in MediaMP 0.1.14–0.3.2 is incompatible with CMP 1.12.
 CMP removed the internal `LocalWindow` API. MediaMP 0.4.0 uses the public `LocalAwtWindow`
 API and requires CMP 1.12.0 or newer. See [#67](https://github.com/open-ani/mediamp/issues/67).
 
+With CMP 1.12.0, use Kotlin 2.3.20 or newer for Kotlin/Wasm and `compileSdk` 37 or newer
+for Android.
+
 ### Version Catalogs
 
 ```toml
