@@ -35,12 +35,26 @@ in state spec v2.
 The latest version
 is: [![Maven Central](https://img.shields.io/maven-central/v/org.openani.mediamp/mediamp-api)](https://img.shields.io/maven-central/v/org.openani.mediamp/mediamp-api)
 
+### Compose Multiplatform versions
+
+Each MediaMP version is built against the following Compose Multiplatform (CMP) version:
+
+| MediaMP version | CMP version |
+|:----------------|:------------|
+| 0.4.0 | 1.12.0 |
+| 0.1.3–0.3.2 | 1.10.1 |
+| 0.0.1–0.1.2 | 1.7.1 |
+
+The desktop MPV backend in MediaMP 0.1.14–0.3.2 is incompatible with CMP 1.12.0 because
+CMP removed the internal `LocalWindow` API. MediaMP 0.4.0 uses the public `LocalAwtWindow`
+API and requires CMP 1.12.0 or newer. See [#67](https://github.com/open-ani/mediamp/issues/67).
+
 ### Version Catalogs
 
 ```toml
 [versions]
 # Replace with the latest version
-mediamp = "0.3.0"
+mediamp = "0.4.0"
 
 [libraries]
 mediamp-all = { module = "org.openani.mediamp:mediamp-all", version.ref = "mediamp" }
@@ -74,7 +88,7 @@ The `-all` bundle includes:
 ```kotlin
 dependencies {
     // Replace with the latest version
-    commonMainApi("org.openani.mediamp:mediamp-all:0.3.0")
+    commonMainApi("org.openani.mediamp:mediamp-all:0.4.0")
 }
 ```
 

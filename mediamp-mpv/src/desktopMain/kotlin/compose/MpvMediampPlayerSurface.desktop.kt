@@ -5,7 +5,6 @@
  *
  * https://github.com/open-ani/mediamp/blob/main/LICENSE
  */
-@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
 
 package org.openani.mediamp.mpv.compose
 
@@ -20,12 +19,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.awt.LocalAwtWindow
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.skiaCanvas
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.window.LocalWindow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filter
@@ -69,16 +69,16 @@ actual fun MpvMediampPlayerSurface(
  * All platform differences live behind [MpvSurfaceDrawResolver] and the player's
  * render-context lifecycle; this composable contains no host checks.
  */
-@OptIn(InternalMediampApi::class)
+@OptIn(InternalMediampApi::class, ExperimentalComposeUiApi::class)
 @Composable
 private fun MpvMediampPlayerSurfaceRing(
     player: MpvMediampPlayer,
     modifier: Modifier,
 ) {
-    val window = LocalWindow.current
+    val window = LocalAwtWindow.current
     val interop: SkiaRenderDeviceInterop? = remember(window) {
         if (window == null) {
-            MPVLog.warn(player.handle.ptr, "LocalWindow.current is null; cannot locate SkiaLayer, video stays black")
+            MPVLog.warn(player.handle.ptr, "LocalAwtWindow.current is null; cannot locate SkiaLayer, video stays black")
             return@remember null
         }
         val layer = window.findSkiaLayer()
@@ -185,12 +185,12 @@ private fun MpvMediampPlayerSurfaceRing(
 
         logOnce("rendering ${width}x${height} via ${drawResolver.rendererName} surface", MPVLog.INFO)
         // Draw through Compose so the op survives RenderNode display-list recording
-        // (raw nativeCanvas draws are dropped there). The image is a Skia-owned texture:
+        // (raw skiaCanvas draws are dropped there). The image is a Skia-owned texture:
         // snapshots of the BRT-wrapped surface itself do not render. The frame normally
         // matches the composable size; during a resize settle it is the old size, so fit
         // it preserving aspect (letterbox) instead of stretching.
         // Draw the GPU-backed frame image straight onto the Compose canvas via the Skia
-        // nativeCanvas — a zero-copy GPU->GPU draw on the current DirectContext. This
+        // skiaCanvas — a zero-copy GPU->GPU draw on the current DirectContext. This
         // deliberately does NOT go through toComposeImageBitmap()/drawImage(ImageBitmap):
         // that reads the GPU image back to a CPU bitmap every frame, which stalls the
         // whole Compose scene (~20ms at 4K, dragging any overlay such as danmaku down to
@@ -207,7 +207,7 @@ private fun MpvMediampPlayerSurfaceRing(
             val dx = (size.width - dstWidth) / 2f
             val dy = (size.height - dstHeight) / 2f
             drawIntoCanvas { canvas ->
-                canvas.nativeCanvas.drawImageRect(
+                canvas.skiaCanvas.drawImageRect(
                     image = frame,
                     src = Rect.makeWH(frame.width.toFloat(), frame.height.toFloat()),
                     dst = Rect.makeXYWH(dx, dy, dstWidth, dstHeight),

@@ -14,7 +14,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.skiaCanvas
 import java.awt.Window
 
 /**
@@ -53,6 +53,6 @@ fun MpvVideoSurface(player: MpvPlayer, window: Window, modifier: Modifier = Modi
 
         if (!player.ensureSurface(width, height, skiaInterop.mtlDevicePtr, directContext)) return@Canvas
         player.renderFrame()
-        player.skiaSurface?.draw(drawContext.canvas.nativeCanvas, 0, 0, null)
+        player.skiaSurface?.draw(drawContext.canvas.skiaCanvas, 0, 0, null)
     }
 }
