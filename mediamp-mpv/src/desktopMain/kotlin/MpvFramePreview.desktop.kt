@@ -46,8 +46,9 @@ internal actual fun createMpvFramePreview(
 ): FramePreview? {
     // Without a surface-ring backend frames cannot be read back, so the
     // feature is absent rather than present-but-always-null.
-    val ringBackend = currentSurfaceBackend() ?: return null
-    return MpvFramePreview(player, context, ringBackend, parentCoroutineContext)
+    // This factory runs from the JVM superclass constructor, before desktop fields
+    // are initialized. Resolve the selected backend only when a preview is requested.
+    return MpvFramePreview(player, context, { (player as MpvMediampPlayer).ringBackend }, parentCoroutineContext)
 }
 
 /**
@@ -62,7 +63,7 @@ internal actual fun createMpvFramePreview(
 internal class MpvFramePreview(
     private val mainPlayer: JvmMpvMediampPlayer,
     private val context: Any,
-    private val ringBackend: MpvSurfaceBackend,
+    private val backendProvider: () -> MpvSurfaceBackend?,
     parentCoroutineContext: CoroutineContext,
 ) : FramePreview, AutoCloseable {
     private val scope = CoroutineScope(
@@ -110,6 +111,7 @@ internal class MpvFramePreview(
     }
 
     private suspend fun obtainSessionLocked(data: MediaData): PreviewSession? {
+        val ringBackend = backendProvider() ?: return null
         session?.let { existing ->
             if (existing.mediaData === data) return existing
             discardSessionLocked()

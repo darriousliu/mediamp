@@ -1,0 +1,133 @@
+name: Release TAO desktop
+
+on:
+  push:
+    branches: [codex/mediamp-0.4.0-tao]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-tao-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    name: Build Windows x64 TAO native runtime
+    if: github.repository == 'darriousliu/mediamp'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
+      - name: Rebuild and verify Windows x64 JNI over the official codec runtime
+        shell: pwsh
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $runtimeJar = Join-Path $env:RUNNER_TEMP 'mediamp-mpv-runtime-windows-x64-0.4.0.jar'
+          Invoke-WebRequest 'https://repo.maven.apache.org/maven2/org/openani/mediamp/mediamp-mpv-runtime-windows-x64/0.4.0/mediamp-mpv-runtime-windows-x64-0.4.0.jar' -OutFile $runtimeJar
+          python scripts/prepare-tao-windows-runtime.py --msys2-dir $env:MSYS2_ROOT --base-runtime-jar $runtimeJar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tao-runtime-windows-x64
+          path: mediamp-mpv/build/prebuilt-runtime-jars/windows-x64/mediamp-mpv-runtime-0.4.0-tao-windows-x64.jar
+          if-no-files-found: error
+  macos-arm64:
+    name: Build macOS arm64 and publish desktop TAO
+    if: github.repository == 'darriousliu/mediamp'
+    needs: windows-x64
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TAO_VERSION: 0.4.0-tao
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK required during Gradle configuration
+        run: |
+          sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0'
+          test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tao-runtime-windows-x64
+          path: mediamp-mpv/build/prebuilt-runtime-jars/windows-x64
+      - name: Prepare verified macOS arm64 native runtime
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          curl --fail --location --retry 3 \
+            https://repo.maven.apache.org/maven2/org/openani/mediamp/mediamp-mpv-runtime-macos-arm64/0.4.0/mediamp-mpv-runtime-macos-arm64-0.4.0.jar \
+            --output "$RUNNER_TEMP/mediamp-mpv-runtime-macos-arm64-0.4.0.jar"
+          python3 scripts/prepare-tao-macos-runtime.py \
+            --base-runtime-jar "$RUNNER_TEMP/mediamp-mpv-runtime-macos-arm64-0.4.0.jar"
+      - name: Test TAO backend, frame generations and local URI handling
+        run: |
+          ./gradlew :mediamp-mpv:desktopTest \
+            --tests '*MpvDesktopRenderBackendTest' \
+            --tests '*MpvTextureGenerationTrackerTest' \
+            --tests '*MpvUriLoadTargetTest' \
+            :mediamp-mpv-tao:test --console=plain \
+            -Pmediamp.mpv.buildvariant= -Pmediamp.ffmpeg.buildvariant= \
+            -Pmediamp.sign.publications.disabled=true
+          python3 -m unittest discover -s scripts -p 'test_publish_tao_release.py'
+      - name: Stage the eleven required Maven coordinates
+        run: |
+          ./gradlew stageTaoDesktopRelease --console=plain \
+            "-Dmaven.repo.local=$RUNNER_TEMP/tao-maven-staging" \
+            -Pmediamp.mpv.buildvariant= -Pmediamp.ffmpeg.buildvariant= \
+            -Pmediamp.sign.publications.disabled=true
+      - name: Freeze and validate the publication payload
+        run: |
+          python3 scripts/publish-tao-release.py \
+            --staging "$RUNNER_TEMP/tao-maven-staging" \
+            --output "$RUNNER_TEMP/tao-release" --version "$TAO_VERSION" \
+            --native-platform macos-arm64 --native-platform windows-x64 --prepare-only
+      - name: Publish to Central, with Packages fallback on a confirmed rejection
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.ORG_GRADLE_PROJECT_mavenCentralUsername }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.ORG_GRADLE_PROJECT_mavenCentralPassword }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.ORG_GRADLE_PROJECT_signingInMemoryKey }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.ORG_GRADLE_PROJECT_signingInMemoryKeyId }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.ORG_GRADLE_PROJECT_signingInMemoryKeyPassword }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          command -v gpg >/dev/null || brew install gnupg
+          python3 scripts/publish-tao-release.py \
+            --output "$RUNNER_TEMP/tao-release" --version "$TAO_VERSION" \
+            --native-platform macos-arm64 --native-platform windows-x64 \
+            --repository "$GITHUB_REPOSITORY"
+      - name: Retain exact publication files and verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediamp-tao-desktop-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/tao-release
+            mediamp-mpv/build/reports/tests/desktopTest
+            mediamp-mpv-tao/build/reports/tests/test
+          if-no-files-found: warn
+          retention-days: 14

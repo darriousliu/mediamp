@@ -34,10 +34,12 @@ private fun Project.hasSigningCredentials(): Boolean {
 }
 
 fun MavenPublishBaseExtension.configurePom(project: Project) {
+    val repositoryUrl = project.providers.gradleProperty("mediamp.repository.url")
+        .getOrElse("https://github.com/open-ani/mediamp").trimEnd('/')
     pom {
         name.set(project.name)
         description.set(project.description)
-        url.set("https://github.com/open-ani/mediamp")
+        url.set(repositoryUrl)
 
         licenses {
             license {
@@ -56,9 +58,9 @@ fun MavenPublishBaseExtension.configurePom(project: Project) {
         }
 
         scm {
-            connection.set("scm:git:https://github.com/open-ani/mediamp.git")
-            developerConnection.set("scm:git:git@github.com:open-ani/mediamp.git")
-            url.set("https://github.com/open-ani/mediamp")
+            connection.set("scm:git:$repositoryUrl.git")
+            developerConnection.set("scm:git:$repositoryUrl.git")
+            url.set(repositoryUrl)
         }
     }
 }

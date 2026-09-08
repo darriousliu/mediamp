@@ -70,7 +70,7 @@ internal class MpvReadbackSurface(
         dropConsumerResources()
     }
 
-    override fun currentFrameImage(directContext: DirectContext): Image? {
+    override fun currentFrameImage(directContext: DirectContext, leasedFrameState: Long?): Image? {
         val state = backend.getFrameState(handlePtr)
         if (state == cachedState) {
             cachedFrame?.let { return it }

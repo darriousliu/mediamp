@@ -41,7 +41,7 @@ internal interface MpvSurfaceConsumer {
      * immutable raster image for the readback fallback), or null when no frame exists
      * yet. Do NOT close the returned image — it is owned by this consumer.
      */
-    fun currentFrameImage(directContext: DirectContext): Image?
+    fun currentFrameImage(directContext: DirectContext, leasedFrameState: Long? = null): Image?
 
     /** Releases all consumer resources and deactivates the native surface. */
     fun release()

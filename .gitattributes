@@ -1,3 +1,5 @@
 # Patch files are applied verbatim with `git apply` (see applyMpvPatches); CRLF
 # conversion on checkout would make their context lines mismatch the LF sources.
 *.patch -text
+# Both runners verify the same JNI source hash before publishing the runtime JARs.
+mediamp-mpv/src/cpp/** text eol=lf

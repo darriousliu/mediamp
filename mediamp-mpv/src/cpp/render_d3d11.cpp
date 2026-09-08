@@ -13,6 +13,9 @@
 // an ID3D12Resource via NT shared handles, so Compose/Skia can sample the video frames
 // zero-copy. Mirrors the macOS path (render_macos.mm): IOSurface ring -> shared texture
 // ring, CGL context -> D3D11 device, glFinish -> event-query wait.
+// The explicit TAO mode instead renders directly into one stable legacy shared
+// texture per size generation. A keyed mutex protects it against ANGLE's staging
+// copy; it has no D3D12 consumer and never reads a Skiko device structure.
 //
 // Threading model: the render thread is the only thread that renders or mutates the
 // buffer ring. mpv's update callback, buffer reconfiguration (resize) and consumer acks
@@ -21,9 +24,9 @@
 // so the screenshot readback (JNI thread) can CopyResource/Map while the render thread
 // is inside mpv_render_context_render.
 //
-// mpv leaves the alpha channel undefined for opaque video (see render_macos.mm); the
-// consumer ignores it by wrapping the texture with an opaque color type (RGB_888X), and
-// the CPU readbacks (PNG/pixels) force alpha to 255. No native alpha-fix pass is needed.
+// Unlike the CGL path, mpv's D3D11 shader writes alpha=1 for opaque video and
+// premultiplies transparent video (video/out/gpu/video.c). Both consumers use RGBA8;
+// CPU readbacks (PNG/pixels) force alpha to 255.
 
 #ifdef _WIN32
 
@@ -55,6 +58,41 @@ void safe_release(T *&object) {
         object = nullptr;
     }
 }
+
+// AcquireSync has positive WAIT_TIMEOUT/WAIT_ABANDONED results: SUCCEEDED(hr)
+// would incorrectly treat them as ownership. Release exactly once after S_OK,
+// including failed rendering/GPU completion, so shutdown cannot leave a lock held.
+class keyed_mutex_lock final {
+public:
+    keyed_mutex_lock(IDXGIKeyedMutex *mutex, const void *instance)
+        : mutex_(mutex), instance_(instance) {
+        if (!mutex_) return;
+        const HRESULT hr = mutex_->AcquireSync(0, 100);
+        acquired_ = hr == S_OK;
+        if (!acquired_ && hr != static_cast<HRESULT>(WAIT_TIMEOUT)) {
+            LOG(instance_, mediampv::LOG_LEVEL_ERROR, "AcquireSync failed: 0x%lx", hr);
+        }
+    }
+    ~keyed_mutex_lock() { release(); }
+    keyed_mutex_lock(const keyed_mutex_lock &) = delete;
+    keyed_mutex_lock &operator=(const keyed_mutex_lock &) = delete;
+
+    bool acquired() const { return !mutex_ || acquired_; }
+    bool release() {
+        if (!acquired_) return true;
+        acquired_ = false;
+        const HRESULT hr = mutex_->ReleaseSync(0);
+        if (hr != S_OK) {
+            LOG(instance_, mediampv::LOG_LEVEL_ERROR, "ReleaseSync failed: 0x%lx", hr);
+            return false;
+        }
+        return true;
+    }
+private:
+    IDXGIKeyedMutex *mutex_ = nullptr; // borrowed for this scope
+    const void *instance_ = nullptr;
+    bool acquired_ = false;
+};
 
 // Extracts the ID3D12Device from Skiko's native DirectXDevice struct (the value of the
 // Direct3DRedrawer.device field, reflected on the Kotlin side).
@@ -130,11 +168,20 @@ ID3D12Device *open_skia_d3d12_device(const void *instance_handle, int64_t skiko_
 namespace mediampv {
 
 bool mpv_handle_t::create_render_context() {
+    return create_render_context_d3d11(d3d11_export_mode::skia_d3d12);
+}
+
+bool mpv_handle_t::create_render_context_tao_d3d11() {
+    return create_render_context_d3d11(d3d11_export_mode::tao_legacy_keyed_mutex);
+}
+
+bool mpv_handle_t::create_render_context_d3d11(d3d11_export_mode mode) {
     if (!handle_) {
         LOG(this, LOG_LEVEL_ERROR, "create_render_context: mpv handle is null");
         return false;
     }
-    if (render_context_) return true;
+    if (render_context_) return d3d11_export_mode_ == mode;
+    d3d11_export_mode_ = mode;
 
     // VIDEO_SUPPORT is required for FFmpeg's d3d11va hwdevice_ctx (hwdec) to attach to
     // this device; retried without it for drivers/WARP levels that reject the flag
@@ -188,8 +235,11 @@ bool mpv_handle_t::create_render_context() {
 
     D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
     if (FAILED(device->CreateQuery(&query_desc, &flush_query_))) {
-        LOG(this, LOG_LEVEL_WARN, "CreateQuery(D3D11_QUERY_EVENT) failed; frame waits degrade to Flush");
+        LOG(this, LOG_LEVEL_ERROR, "CreateQuery(D3D11_QUERY_EVENT) failed; cannot prove frame completion");
         flush_query_ = nullptr;
+        safe_release(context);
+        safe_release(device);
+        return false;
     }
 
     mpv_d3d11_init_params init_params{device};
@@ -222,13 +272,55 @@ bool mpv_handle_t::destroy_render_context() {
 }
 
 bool mpv_handle_t::set_surface_config(int width, int height, int64_t skiko_device_ptr) {
-    if (!render_thread_) return false;
+    if (!render_thread_ || d3d11_export_mode_ != d3d11_export_mode::skia_d3d12) return false;
     {
         std::lock_guard<std::mutex> guard(render_mutex_);
         pending_width_ = width;
         pending_height_ = height;
         pending_device_ptr_ = skiko_device_ptr;
         config_pending_ = true;
+    }
+    render_cv_.notify_all();
+    return true;
+}
+
+bool mpv_handle_t::set_surface_config_tao_d3d11(int width, int height) {
+    if (!render_thread_ || d3d11_export_mode_ != d3d11_export_mode::tao_legacy_keyed_mutex) {
+        return false;
+    }
+    if (width > 0x3FFF || height > 0x3FFF) return false; // packed dimensions
+    {
+        std::lock_guard<std::mutex> guard(render_mutex_);
+        pending_width_ = width;
+        pending_height_ = height;
+        pending_device_ptr_ = 0;
+        config_pending_ = true;
+    }
+    render_cv_.notify_all();
+    return true;
+}
+
+int64_t mpv_handle_t::get_shared_texture_tao_d3d11(uint32_t generation) {
+    std::lock_guard<std::mutex> guard(render_mutex_);
+    if (d3d11_export_mode_ != d3d11_export_mode::tao_legacy_keyed_mutex ||
+        !buffers_allocated_ || generation != (buffer_generation_ & 0xFFFFu)) return 0;
+    return reinterpret_cast<int64_t>(buffers_[0].shared_handle);
+}
+
+int mpv_handle_t::get_retired_generation_tao_d3d11() {
+    std::lock_guard<std::mutex> guard(render_mutex_);
+    return d3d11_export_mode_ == d3d11_export_mode::tao_legacy_keyed_mutex && has_retired_buffers_
+        ? static_cast<int>(retired_buffer_generation_ & 0xFFFFu) : -1;
+}
+
+bool mpv_handle_t::ack_retired_texture_tao_d3d11(uint32_t generation) {
+    {
+        std::lock_guard<std::mutex> guard(render_mutex_);
+        if (d3d11_export_mode_ != d3d11_export_mode::tao_legacy_keyed_mutex ||
+            !has_retired_buffers_ || generation != (retired_buffer_generation_ & 0xFFFFu)) {
+            return false;
+        }
+        retire_ack_pending_ = true;
     }
     render_cv_.notify_all();
     return true;
@@ -247,6 +339,7 @@ int64_t mpv_handle_t::get_buffer_texture(int index) {
 bool mpv_handle_t::ack_retired_buffers() {
     {
         std::lock_guard<std::mutex> guard(render_mutex_);
+        if (d3d11_export_mode_ != d3d11_export_mode::skia_d3d12) return false;
         retire_ack_pending_ = true;
     }
     render_cv_.notify_all();
@@ -297,7 +390,8 @@ void mpv_handle_t::render_thread_loop() {
     std::unique_lock<std::mutex> lock(render_mutex_);
     while (!render_quit_) {
         render_cv_.wait(lock, [this] {
-            return render_quit_ || render_pending_ || config_pending_ || retire_ack_pending_;
+            return render_quit_ || render_pending_ || retire_ack_pending_ ||
+                (config_pending_ && (!has_retired_buffers_ || pending_width_ <= 0 || pending_height_ <= 0));
         });
         if (render_quit_) break;
 
@@ -313,7 +407,7 @@ void mpv_handle_t::render_thread_loop() {
         // of an unacked one (the consumer may still be sampling it) — postpone until
         // the ack arrives.
         bool configured = false;
-        if (config_pending_ && !has_retired_buffers_) {
+        if (config_pending_ && (!has_retired_buffers_ || pending_width_ <= 0 || pending_height_ <= 0)) {
             config_pending_ = false;
             configured = apply_config_locked();
         }
@@ -342,7 +436,8 @@ void mpv_handle_t::render_thread_loop() {
         // nothing new (e.g. resizing while paused).
         if (!has_new_frame && !configured) continue;
 
-        int next = (latest_index_ + 1) % kD3D11BufferCount;
+        const int next = d3d11_export_mode_ == d3d11_export_mode::tao_legacy_keyed_mutex
+            ? 0 : (latest_index_ + 1) % kD3D11BufferCount;
         d3d11_buffer target = buffers_[next];
         lock.unlock();
         bool rendered = render_into(target);
@@ -391,6 +486,7 @@ bool mpv_handle_t::apply_config_locked() {
     }
 
     if (buffers_allocated_) {
+        retired_buffer_generation_ = buffer_generation_;
         for (int i = 0; i < kD3D11BufferCount; ++i) {
             retired_buffers_[i] = buffers_[i];
             buffers_[i] = d3d11_buffer{};
@@ -399,7 +495,8 @@ bool mpv_handle_t::apply_config_locked() {
         buffers_allocated_ = false;
     }
 
-    if (device_ptr != buffer_device_ptr_ || !skia_device_) {
+    if (d3d11_export_mode_ == d3d11_export_mode::skia_d3d12 &&
+        (device_ptr != buffer_device_ptr_ || !skia_device_)) {
         safe_release(skia_device_);
         skia_device_ = open_skia_d3d12_device(this, device_ptr);
         // device_ptr == 0 (headless) legitimately yields no D3D12 side; a non-zero
@@ -408,7 +505,9 @@ bool mpv_handle_t::apply_config_locked() {
     }
 
     bool ok = true;
-    for (int i = 0; i < kD3D11BufferCount && ok; ++i) {
+    const int buffer_count = d3d11_export_mode_ == d3d11_export_mode::tao_legacy_keyed_mutex
+        ? 1 : kD3D11BufferCount;
+    for (int i = 0; i < buffer_count && ok; ++i) {
         ok = allocate_buffer(buffers_[i], width, height);
     }
     if (!ok) {
@@ -429,8 +528,9 @@ bool mpv_handle_t::apply_config_locked() {
     latest_index_ = -1;
     ++buffer_generation_;
     publish_state_locked();
-    LOG(this, LOG_LEVEL_INFO, "buffer ring allocated %dx%d gen=%u d3d12=%d",
-        width, height, buffer_generation_, skia_device_ ? 1 : 0);
+    LOG(this, LOG_LEVEL_INFO, "surface allocated %dx%d gen=%u buffers=%d d3d12=%d tao=%d",
+        width, height, buffer_generation_, buffer_count, skia_device_ ? 1 : 0,
+        d3d11_export_mode_ == d3d11_export_mode::tao_legacy_keyed_mutex ? 1 : 0);
     return true;
 }
 
@@ -446,9 +546,11 @@ bool mpv_handle_t::allocate_buffer(d3d11_buffer &buffer, int width, int height) 
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    // NT-handle sharing without keyed mutex: the render thread CPU-waits for frame
-    // completion before publishing, so cross-device reads never race the writer.
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    const bool legacy = d3d11_export_mode_ == d3d11_export_mode::tao_legacy_keyed_mutex;
+    // Legacy KEYEDMUTEX must not be combined with SHARED or SHARED_NTHANDLE.
+    // AWT retains the existing NT-handle ring; TAO serializes both devices with key 0.
+    desc.MiscFlags = legacy ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+        : D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
     ID3D11Texture2D *texture = nullptr;
     HRESULT hr = d3d_device_->CreateTexture2D(&desc, nullptr, &texture);
@@ -459,17 +561,34 @@ bool mpv_handle_t::allocate_buffer(d3d11_buffer &buffer, int width, int height) 
     }
 
     HANDLE shared_handle = nullptr;
-    IDXGIResource1 *dxgi_resource = nullptr;
-    hr = texture->QueryInterface(
-        __uuidof(IDXGIResource1), reinterpret_cast<void **>(&dxgi_resource));
-    if (SUCCEEDED(hr)) {
-        hr = dxgi_resource->CreateSharedHandle(
-            nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-            nullptr, &shared_handle);
-        dxgi_resource->Release();
+    IDXGIKeyedMutex *keyed_mutex = nullptr;
+    if (legacy) {
+        hr = texture->QueryInterface(
+            __uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&keyed_mutex));
+        if (SUCCEEDED(hr) && keyed_mutex) {
+            IDXGIResource *dxgi_resource = nullptr;
+            hr = texture->QueryInterface(
+                __uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgi_resource));
+            if (SUCCEEDED(hr) && dxgi_resource) {
+                hr = dxgi_resource->GetSharedHandle(&shared_handle);
+                dxgi_resource->Release();
+            }
+        }
+    } else {
+        IDXGIResource1 *dxgi_resource = nullptr;
+        hr = texture->QueryInterface(
+            __uuidof(IDXGIResource1), reinterpret_cast<void **>(&dxgi_resource));
+        if (SUCCEEDED(hr) && dxgi_resource) {
+            hr = dxgi_resource->CreateSharedHandle(
+                nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                nullptr, &shared_handle);
+            dxgi_resource->Release();
+        }
     }
     if (FAILED(hr) || !shared_handle) {
-        LOG(this, LOG_LEVEL_ERROR, "CreateSharedHandle failed: 0x%lx", hr);
+        LOG(this, LOG_LEVEL_ERROR, "%s failed: 0x%lx",
+            legacy ? "GetSharedHandle/QueryInterface(keyed mutex)" : "CreateSharedHandle", hr);
+        safe_release(keyed_mutex);
         texture->Release();
         return false;
     }
@@ -489,6 +608,7 @@ bool mpv_handle_t::allocate_buffer(d3d11_buffer &buffer, int width, int height) 
     buffer.texture = texture;
     buffer.shared_handle = shared_handle;
     buffer.d3d12_resource = d3d12_resource;
+    buffer.keyed_mutex = keyed_mutex;
     return true;
 }
 
@@ -496,7 +616,9 @@ void mpv_handle_t::destroy_buffer_ring(d3d11_buffer *ring) {
     for (int i = 0; i < kD3D11BufferCount; ++i) {
         d3d11_buffer &buffer = ring[i];
         safe_release(buffer.d3d12_resource);
-        if (buffer.shared_handle) CloseHandle(buffer.shared_handle);
+        // GetSharedHandle returns a DXGI token, not an owned Win32 handle.
+        if (buffer.shared_handle && !buffer.keyed_mutex) CloseHandle(buffer.shared_handle);
+        safe_release(buffer.keyed_mutex);
         safe_release(buffer.texture);
         buffer = d3d11_buffer{};
     }
@@ -515,6 +637,9 @@ void mpv_handle_t::publish_state_locked() {
 
 bool mpv_handle_t::render_into(const d3d11_buffer &buffer) {
     if (!render_context_ || !buffer.texture) return false;
+    std::lock_guard<std::mutex> access_guard(d3d_access_mutex_);
+    keyed_mutex_lock shared_lock(buffer.keyed_mutex, this);
+    if (!shared_lock.acquired()) return false;
 
     // D3D11 render targets are top-down (row 0 = top), matching both Skia's
     // SurfaceOrigin.TOP_LEFT sampling and the PNG readback; no flip needed.
@@ -528,16 +653,14 @@ bool mpv_handle_t::render_into(const d3d11_buffer &buffer) {
     // The glFinish equivalent: Skia samples this texture on another device right after
     // the buffer is published, so the frame must be complete, not merely submitted.
     // Runs on the render thread, so it never blocks UI.
-    wait_for_gpu();
-    return render_result >= 0;
+    const bool completed = wait_for_gpu();
+    const bool released = shared_lock.release();
+    return render_result >= 0 && completed && released;
 }
 
 bool mpv_handle_t::wait_for_gpu() {
     if (!d3d_context_) return false;
-    if (!flush_query_) {
-        d3d_context_->Flush();
-        return true;
-    }
+    if (!flush_query_) return false; // Flush only submits; it cannot prove completion.
     d3d_context_->End(flush_query_);
     // Bound the spin: on a GPU hang / TDR the query never retires, and an unbounded loop
     // would peg a core forever and wedge the render thread so teardown can never join it.
@@ -621,6 +744,8 @@ bool mpv_handle_t::read_frame_argb_locked(
     if (!buffers_allocated_ || latest_index_ < 0 || !d3d_device_ || !d3d_context_) {
         return false;
     }
+    keyed_mutex_lock shared_lock(buffers_[latest_index_].keyed_mutex, this);
+    if (!shared_lock.acquired()) return false;
     ID3D11Texture2D *source = buffers_[latest_index_].texture;
     if (!source) return false;
 
@@ -664,6 +789,9 @@ bool mpv_handle_t::read_frame_argb_locked(
 
 bool mpv_handle_t::read_surface_pixels(
     std::vector<uint32_t> &out_pixels, int &out_width, int &out_height) {
+    // Never hold render_mutex_ while waiting for a running mpv render: its update
+    // callback is allowed to acquire render_mutex_. Keep this lock order in PNG too.
+    std::lock_guard<std::mutex> access_guard(d3d_access_mutex_);
     std::lock_guard<std::mutex> guard(render_mutex_);
     return read_frame_argb_locked(out_pixels, out_width, out_height);
 }
@@ -677,6 +805,7 @@ bool mpv_handle_t::save_surface_png(const char *path) {
     std::vector<uint32_t> pixels;
     int width = 0, height = 0;
     {
+        std::lock_guard<std::mutex> access_guard(d3d_access_mutex_);
         std::lock_guard<std::mutex> guard(render_mutex_);
         if (!read_frame_argb_locked(pixels, width, height)) return false;
     }

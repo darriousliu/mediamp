@@ -34,7 +34,7 @@ plugins {
 }
 
 allprojects {
-    group = "org.openani.mediamp"
+    group = providers.gradleProperty("maven.group").getOrElse("org.openani.mediamp")
     version = properties["version.name"].toString()
 
     repositories {
@@ -62,4 +62,18 @@ idea {
     module {
         excludeDirs.add(file(".kotlin"))
     }
+}
+
+// Freeze the complete desktop dependency closure before attempting either registry.
+// Deliberately omit the all-platform aggregator: this release includes these two native targets.
+tasks.register("stageTaoDesktopRelease") {
+    group = "publishing"
+    description = "Stage the TAO JVM libraries and macOS arm64 / Windows x64 runtimes"
+    listOf("mediamp-api", "mediamp-internal-utils", "mediamp-native-loader", "mediamp-mpv").forEach { module ->
+        dependsOn(":$module:publishKotlinMultiplatformPublicationToMavenLocal")
+        dependsOn(":$module:publishDesktopPublicationToMavenLocal")
+    }
+    dependsOn(":mediamp-mpv-tao:publishMavenPublicationToMavenLocal")
+    dependsOn(":mediamp-mpv:publishMpvRuntimeMacosArm64PublicationToMavenLocal")
+    dependsOn(":mediamp-mpv:publishMpvRuntimeWindowsX64PublicationToMavenLocal")
 }

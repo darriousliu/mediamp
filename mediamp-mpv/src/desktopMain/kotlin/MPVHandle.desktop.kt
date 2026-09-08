@@ -12,6 +12,32 @@ package org.openani.mediamp.mpv
 import java.awt.Component
 import org.openani.mediamp.InternalMediampApi
 
+/** Selects TAO's stable legacy D3D11 export mode before creating the render context. */
+@InternalMediampApi
+external fun nCreateRenderContextTaoD3D11(ptr: Long): Boolean
+
+@InternalMediampApi
+external fun nSetSurfaceConfigTaoD3D11(ptr: Long, width: Int, height: Int): Boolean
+
+/** Borrowed IDXGIResource::GetSharedHandle; zero if the expected generation changed. */
+@InternalMediampApi
+external fun nGetSharedTextureTaoD3D11(ptr: Long, generation: Int): Long
+
+/** Release exactly the generation whose TextureView import was disposed. */
+@InternalMediampApi
+external fun nAckRetiredTaoD3D11Texture(ptr: Long, generation: Int): Boolean
+
+/** Retired export generation, or -1 if no export currently awaits retirement. */
+@InternalMediampApi
+external fun nGetRetiredGenerationTaoD3D11(ptr: Long): Int
+
+/** Pins the published IOSurface slot until nReleaseFrameMacos after the GPU copy. */
+@InternalMediampApi
+external fun nAcquireFrameStateMacos(ptr: Long): Long
+
+@InternalMediampApi
+external fun nReleaseFrameMacos(ptr: Long, state: Long): Boolean
+
 // Desktop surface-ring render paths. Each native render thread drives mpv into a ring
 // of GPU textures that the platform-specific Kotlin backend wraps for Skia. The native
 // implementation owns the producer context and textures; Skia only borrows consumer

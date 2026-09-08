@@ -5,6 +5,8 @@
 name: 'Build'
 on:
   push:
+    branches-ignore:
+    - 'codex/mediamp-0.4.0-tao'
     paths-ignore:
     - '**/*.md'
   pull_request:

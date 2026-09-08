@@ -131,6 +131,10 @@ bool mpv_handle_t::set_surface_config(int width, int height, int64_t mtl_device_
     if (!render_thread_) return false;
     {
         std::lock_guard<std::mutex> guard(render_mutex_);
+        // TAO owns the device/context. Retain the borrowed device synchronously,
+        // before this call returns; the producer can consume this request later.
+        if (mtl_device_ptr) CFRetain((CFTypeRef) (uintptr_t) mtl_device_ptr);
+        if (pending_device_ptr_) CFRelease((CFTypeRef) (uintptr_t) pending_device_ptr_);
         pending_width_ = width;
         pending_height_ = height;
         pending_device_ptr_ = mtl_device_ptr;
@@ -142,6 +146,35 @@ bool mpv_handle_t::set_surface_config(int width, int height, int64_t mtl_device_
 
 uint64_t mpv_handle_t::get_frame_state() {
     return frame_state_.load(std::memory_order_acquire);
+}
+
+uint64_t mpv_handle_t::acquire_frame_state_macos() {
+    std::lock_guard<std::mutex> guard(render_mutex_);
+    if (!buffers_allocated_ || latest_index_ < 0) return 0xFull << 44;
+    ++buffers_[latest_index_].leases;
+    return frame_state_.load(std::memory_order_acquire);
+}
+
+bool mpv_handle_t::release_frame_macos(uint64_t state) {
+    const uint32_t generation = static_cast<uint32_t>(state >> 48);
+    const int index = static_cast<int>((state >> 44) & 0xFu);
+    {
+        std::lock_guard<std::mutex> guard(render_mutex_);
+        if (!buffers_allocated_ || generation != (buffer_generation_ & 0xFFFFu) ||
+            index >= kMacosBufferCount || !buffers_[index].leases) return false;
+        --buffers_[index].leases;
+        // Wake a postponed reconfiguration or frame without calling Compose/Skia.
+        if (redraw_pending_) render_pending_ = true;
+    }
+    render_cv_.notify_all();
+    return true;
+}
+
+bool mpv_handle_t::has_frame_leases_locked() const {
+    for (const auto &buffer : buffers_) {
+        if (buffer.leases) return true;
+    }
+    return false;
 }
 
 int64_t mpv_handle_t::get_buffer_texture(int index) {
@@ -205,7 +238,9 @@ void mpv_handle_t::render_thread_loop() {
     std::unique_lock<std::mutex> lock(render_mutex_);
     while (!render_quit_) {
         render_cv_.wait(lock, [this] {
-            return render_quit_ || render_pending_ || config_pending_ || retire_ack_pending_;
+            return render_quit_ || render_pending_ || retire_ack_pending_ ||
+                (config_pending_ && !has_frame_leases_locked() &&
+                    (!has_retired_buffers_ || pending_width_ <= 0 || pending_height_ <= 0));
         });
         if (render_quit_) break;
 
@@ -221,7 +256,8 @@ void mpv_handle_t::render_thread_loop() {
         // of an unacked one (the consumer may still be sampling it) — postpone until
         // the ack arrives.
         bool configured = false;
-        if (config_pending_ && !has_retired_buffers_) {
+        if (config_pending_ && !has_frame_leases_locked() &&
+            (!has_retired_buffers_ || pending_width_ <= 0 || pending_height_ <= 0)) {
             config_pending_ = false;
             configured = apply_config_locked();
         }
@@ -248,9 +284,23 @@ void mpv_handle_t::render_thread_loop() {
         }
         // After a reconfig, redraw the current frame into the new ring even if mpv has
         // nothing new (e.g. resizing while paused).
-        if (!has_new_frame && !configured) continue;
+        if (!has_new_frame && !configured && !redraw_pending_) continue;
 
-        int next = (latest_index_ + 1) % kMacosBufferCount;
+        int next = -1;
+        for (int offset = 1; offset <= kMacosBufferCount; ++offset) {
+            const int candidate = (latest_index_ + offset) % kMacosBufferCount;
+            // Keep the published slot immutable so an acquire racing this write
+            // can always safely lease the latest frame under render_mutex_.
+            if (candidate != latest_index_ && !buffers_[candidate].leases) {
+                next = candidate;
+                break;
+            }
+        }
+        if (next < 0) {
+            redraw_pending_ = true;
+            continue;
+        }
+        redraw_pending_ = false;
         macos_buffer target = buffers_[next];
         lock.unlock();
         bool rendered = render_into(target);
@@ -274,6 +324,10 @@ void mpv_handle_t::render_thread_loop() {
 bool mpv_handle_t::apply_config_locked() {
     const int width = pending_width_, height = pending_height_;
     const int64_t device_ptr = pending_device_ptr_;
+    // Transfer the queued retain into a strong local for every return path.
+    id<MTLDevice> requested_device = device_ptr
+        ? (id<MTLDevice>) CFBridgingRelease((CFTypeRef) (uintptr_t) device_ptr) : nil;
+    pending_device_ptr_ = 0;
 
     if (width <= 0 || height <= 0) {
         // Deactivate. The consumer drops all texture references before requesting
@@ -307,9 +361,7 @@ bool mpv_handle_t::apply_config_locked() {
         buffers_allocated_ = false;
     }
 
-    id<MTLDevice> device = device_ptr != 0
-        ? (__bridge id<MTLDevice>) (void *) (uintptr_t) device_ptr
-        : MTLCreateSystemDefaultDevice();
+    id<MTLDevice> device = requested_device ?: MTLCreateSystemDefaultDevice();
     bool ok = device != nil;
     for (int i = 0; i < kMacosBufferCount && ok; ++i) {
         ok = allocate_buffer(buffers_[i], width, height, (__bridge void *) device);
@@ -469,6 +521,12 @@ void mpv_handle_t::drain_one_frame() {
 
 void mpv_handle_t::cleanup_render_resources() {
     stop_render_thread();
+
+    {
+        std::lock_guard<std::mutex> guard(render_mutex_);
+        if (pending_device_ptr_) CFRelease((CFTypeRef) (uintptr_t) pending_device_ptr_);
+        pending_device_ptr_ = 0;
+    }
 
     auto context = (CGLContextObj) cgl_context_;
     if (context) {

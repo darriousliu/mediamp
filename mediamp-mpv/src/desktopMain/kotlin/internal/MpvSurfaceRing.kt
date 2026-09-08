@@ -379,8 +379,8 @@ internal class MpvSurfaceRing(
      * returned until the new ring has content, so resizes never flash black. Do NOT
      * close the returned image — it is owned by this ring.
      */
-    override fun currentFrameImage(directContext: DirectContext): Image? {
-        val state = backend.getFrameState(handlePtr)
+    override fun currentFrameImage(directContext: DirectContext, leasedFrameState: Long?): Image? {
+        val state = leasedFrameState ?: backend.getFrameState(handlePtr)
         if (state == cachedState && surfaceContext === directContext) {
             cachedFrame?.let { return it }
         }

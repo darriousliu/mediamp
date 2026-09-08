@@ -28,6 +28,7 @@ struct ID3D11Query;
 struct ID3D11Texture2D;
 struct ID3D12Device;
 struct ID3D12Resource;
+struct IDXGIKeyedMutex;
 #endif
 #include "compatible_thread.h"
 #include "global_lock.h"
@@ -77,6 +78,18 @@ public:
     // packed frame state and sample the latest buffer. Implemented in render_d3d11.cpp.
     bool create_render_context();
     bool destroy_render_context();
+
+    // TAO/ANGLE uses one stable legacy shared texture per generation. This mode
+    // must be selected before creating the render context; it never interprets a
+    // Skiko device pointer or opens a D3D12 resource.
+    bool create_render_context_tao_d3d11();
+    bool set_surface_config_tao_d3d11(int width, int height);
+    // Borrowed GetSharedHandle result, NOT an NT handle; never CloseHandle it.
+    // Returns 0 if the generation read from get_frame_state() is no longer current.
+    int64_t get_shared_texture_tao_d3d11(uint32_t generation);
+    int get_retired_generation_tao_d3d11(); // -1 when there is no retired texture
+    // Only after the consumer has disposed the import for this retired generation.
+    bool ack_retired_texture_tao_d3d11(uint32_t generation);
 
     // Requests the render thread to (re)allocate the buffer ring at width x height,
     // opening each texture on the ID3D12Device extracted from skiko_device_ptr (a
@@ -158,6 +171,11 @@ public:
     // generation change means the buffer ring was reallocated (re-wrap textures, then
     // call ack_retired_buffers()).
     uint64_t get_frame_state();
+    // Hold the returned frame until the consumer's GPU copy has completed. While
+    // leased, its slot cannot be rendered into and configuration changes wait.
+    // The existing get_buffer_texture(index) remains valid throughout the lease.
+    uint64_t acquire_frame_state_macos();
+    bool release_frame_macos(uint64_t state);
     // Retained id<MTLTexture> pointer of ring buffer `index` for the current generation.
     int64_t get_buffer_texture(int index);
     // Consumer no longer references the previous generation; its buffers may be freed.
@@ -227,8 +245,9 @@ private:
     static constexpr int kD3D11BufferCount = 3;
     struct d3d11_buffer {
         ID3D11Texture2D *texture = nullptr;    // render target on d3d_device_
-        HANDLE shared_handle = nullptr;        // NT handle from CreateSharedHandle
+        HANDLE shared_handle = nullptr;     // owned NT handle, or borrowed legacy handle
         ID3D12Resource *d3d12_resource = nullptr;  // opened on the consumer's device, may be null
+        IDXGIKeyedMutex *keyed_mutex = nullptr;  // TAO only; also identifies legacy ownership
     };
     d3d11_buffer buffers_[kD3D11BufferCount];
     // Previous generation, kept alive until the consumer re-wrapped and acked, so a
@@ -238,6 +257,9 @@ private:
     // DirectXDevice struct; null while the ring is headless (device ptr 0).
     ID3D12Device *skia_device_ = nullptr;
     bool has_retired_buffers_ = false;
+    uint32_t retired_buffer_generation_ = 0;
+    enum class d3d11_export_mode { skia_d3d12, tao_legacy_keyed_mutex };
+    d3d11_export_mode d3d11_export_mode_ = d3d11_export_mode::skia_d3d12;
     bool buffers_allocated_ = false;
     int buffer_width_ = 0, buffer_height_ = 0;
     int64_t buffer_device_ptr_ = 0;
@@ -254,6 +276,9 @@ private:
     bool render_pending_ = false;
     bool render_quit_ = false;
     std::mutex render_mutex_;
+    // Serializes same-device producer/readback access to the single TAO texture.
+    // The DXGI mutex handles the separate ANGLE device, not our own CPU threads.
+    std::mutex d3d_access_mutex_;
     std::condition_variable render_cv_;
     void *render_thread_ = nullptr;  // std::thread*, owned (render_d3d11.cpp)
 
@@ -270,8 +295,9 @@ private:
     bool render_into(const d3d11_buffer &buffer);
     void drain_one_frame();
     bool wait_for_gpu();  // End(flush_query_) + poll; render thread only
+    bool create_render_context_d3d11(d3d11_export_mode mode);
     // Staging-texture readback of the latest frame; shared by save_surface_png and
-    // read_surface_pixels. Assumes render_mutex_ is held.
+    // read_surface_pixels. Both locks are held, in d3d_access_mutex_ -> render_mutex_ order.
     bool read_frame_argb_locked(std::vector<uint32_t> &out_pixels, int &out_width, int &out_height);
 
     // OpenGL fallback state (render_opengl_win.cpp). Behind a pointer so the D3D11
@@ -320,6 +346,7 @@ private:
         void *mtl_texture = nullptr;  // retained id<MTLTexture>
         uint32_t texture = 0;         // GL_TEXTURE_RECTANGLE bound to the IOSurface
         uint32_t fbo = 0;
+        uint32_t leases = 0;
     };
     macos_buffer buffers_[kMacosBufferCount];
     // Previous generation, kept alive until the consumer re-wrapped and acked, so a
@@ -340,6 +367,7 @@ private:
     int64_t pending_device_ptr_ = 0;
     bool retire_ack_pending_ = false;
     bool render_pending_ = false;
+    bool redraw_pending_ = false; // a frame deferred because every writable slot was leased
     bool render_quit_ = false;
     std::mutex render_mutex_;
     std::condition_variable render_cv_;
@@ -357,6 +385,7 @@ private:
     void publish_state_locked();
     bool render_into(const macos_buffer &buffer);
     void drain_one_frame();
+    bool has_frame_leases_locked() const;
 #endif
 
 #ifdef __linux__

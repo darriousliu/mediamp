@@ -37,7 +37,7 @@ internal fun Project.registerCompositeDesktopRuntimeElements(
         outgoing.artifact(runtimeJarArtifact.artifactNotation) {
             runtimeJarArtifact.builtBy?.let { builtBy(it) }
         }
-        outgoing.capability("org.openani.mediamp:$moduleName:$version")
+        outgoing.capability("${project.group}:$moduleName:$version")
     }
 
 internal fun Project.createDependencyOnlyDesktopRuntimeElements(
@@ -140,11 +140,16 @@ internal fun Project.wireDesktopRuntimeDependencyConstraints(
     configurationNames: List<String> = listOf("desktopApiElements", "desktopRuntimeElements"),
 ) {
     afterEvaluate {
+        // Kotlin 2.4 marks outgoing variants as non-declarable. Keep the constraints
+        // in a dependency scope and inherit them instead of mutating ApiElements.
+        val constraints = configurations.dependencyScope("desktopNativeRuntimeConstraints") {
+            dependencyNotations.forEach { notation ->
+                dependencyConstraints.add(project.dependencies.constraints.create("$notation!!"))
+            }
+        }
         configurationNames.forEach { configName ->
             configurations.findByName(configName)?.let { config ->
-                dependencyNotations.forEach { notation ->
-                    config.dependencyConstraints.add(dependencies.constraints.create("$notation!!"))
-                }
+                config.extendsFrom(constraints.get())
             }
         }
     }

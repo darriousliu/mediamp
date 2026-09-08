@@ -125,6 +125,11 @@ extern "C" {
     JNIEXPORT jboolean JNICALL FN_ANDROID(nDetachAndroidSurface)(JNIEnv *env, jclass clazz, jlong ptr);
 
 #ifdef _WIN32
+	JNIEXPORT jboolean JNICALL FN_DESKTOP(nCreateRenderContextTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr);
+	JNIEXPORT jboolean JNICALL FN_DESKTOP(nSetSurfaceConfigTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr, jint width, jint height);
+	JNIEXPORT jlong JNICALL FN_DESKTOP(nGetSharedTextureTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr, jint generation);
+	JNIEXPORT jint JNICALL FN_DESKTOP(nGetRetiredGenerationTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr);
+	JNIEXPORT jboolean JNICALL FN_DESKTOP(nAckRetiredTaoD3D11Texture)(JNIEnv *env, jclass clazz, jlong ptr, jint generation);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nCreateRenderContextD3D11)(JNIEnv *env, jclass clazz, jlong ptr);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nDestroyRenderContextD3D11)(JNIEnv *env, jclass clazz, jlong ptr);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nSetSurfaceConfigD3D11)(JNIEnv *env, jclass clazz, jlong ptr, jint width, jint height, jlong skiko_device_ptr);
@@ -152,6 +157,8 @@ extern "C" {
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nDestroyRenderContextMacos)(JNIEnv *env, jclass clazz, jlong ptr);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nSetSurfaceConfigMacos)(JNIEnv *env, jclass clazz, jlong ptr, jint width, jint height, jlong mtl_device_ptr);
 	JNIEXPORT jlong JNICALL FN_DESKTOP(nGetFrameStateMacos)(JNIEnv *env, jclass clazz, jlong ptr);
+	JNIEXPORT jlong JNICALL FN_DESKTOP(nAcquireFrameStateMacos)(JNIEnv *env, jclass clazz, jlong ptr);
+	JNIEXPORT jboolean JNICALL FN_DESKTOP(nReleaseFrameMacos)(JNIEnv *env, jclass clazz, jlong ptr, jlong state);
 	JNIEXPORT jlong JNICALL FN_DESKTOP(nGetBufferTextureMacos)(JNIEnv *env, jclass clazz, jlong ptr, jint index);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nAckRetiredBuffersMacos)(JNIEnv *env, jclass clazz, jlong ptr);
 	JNIEXPORT jboolean JNICALL FN_DESKTOP(nHasMetalSurface)(JNIEnv *env, jclass clazz, jlong ptr);
@@ -451,6 +458,33 @@ JNIEXPORT jboolean JNICALL FN_ANDROID(nDetachAndroidSurface)(JNIEnv *env, jclass
 
 #ifdef _WIN32
 
+JNIEXPORT jboolean JNICALL FN_DESKTOP(nCreateRenderContextTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr) {
+    auto *instance = get_instance(ptr);
+    return instance ? instance->create_render_context_tao_d3d11() : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL FN_DESKTOP(nSetSurfaceConfigTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr, jint width, jint height) {
+    auto *instance = get_instance(ptr);
+    return instance ? instance->set_surface_config_tao_d3d11(width, height) : JNI_FALSE;
+}
+
+JNIEXPORT jlong JNICALL FN_DESKTOP(nGetSharedTextureTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr, jint generation) {
+    auto *instance = get_instance(ptr);
+    return instance && generation >= 0 && generation <= 0xFFFF
+        ? instance->get_shared_texture_tao_d3d11(static_cast<uint32_t>(generation)) : 0;
+}
+
+JNIEXPORT jint JNICALL FN_DESKTOP(nGetRetiredGenerationTaoD3D11)(JNIEnv *env, jclass clazz, jlong ptr) {
+    auto *instance = get_instance(ptr);
+    return instance ? instance->get_retired_generation_tao_d3d11() : -1;
+}
+
+JNIEXPORT jboolean JNICALL FN_DESKTOP(nAckRetiredTaoD3D11Texture)(JNIEnv *env, jclass clazz, jlong ptr, jint generation) {
+    auto *instance = get_instance(ptr);
+    return instance && generation >= 0 && generation <= 0xFFFF
+        ? instance->ack_retired_texture_tao_d3d11(static_cast<uint32_t>(generation)) : JNI_FALSE;
+}
+
 JNIEXPORT jboolean JNICALL FN_DESKTOP(nCreateRenderContextD3D11)(JNIEnv * env, jclass clazz, jlong ptr) {
     auto *instance = get_instance(ptr);
     return instance ? instance->create_render_context() : JNI_FALSE;
@@ -577,6 +611,16 @@ JNIEXPORT jboolean JNICALL FN_DESKTOP(nSetSurfaceConfigMacos)(JNIEnv * env, jcla
 JNIEXPORT jlong JNICALL FN_DESKTOP(nGetFrameStateMacos)(JNIEnv * env, jclass clazz, jlong ptr) {
     auto *instance = get_instance(ptr);
     return instance ? static_cast<jlong>(instance->get_frame_state()) : 0;
+}
+
+JNIEXPORT jlong JNICALL FN_DESKTOP(nAcquireFrameStateMacos)(JNIEnv *env, jclass clazz, jlong ptr) {
+    auto *instance = get_instance(ptr);
+    return instance ? static_cast<jlong>(instance->acquire_frame_state_macos()) : static_cast<jlong>(0xFull << 44);
+}
+
+JNIEXPORT jboolean JNICALL FN_DESKTOP(nReleaseFrameMacos)(JNIEnv *env, jclass clazz, jlong ptr, jlong state) {
+    auto *instance = get_instance(ptr);
+    return instance ? instance->release_frame_macos(static_cast<uint64_t>(state)) : JNI_FALSE;
 }
 
 JNIEXPORT jlong JNICALL FN_DESKTOP(nGetBufferTextureMacos)(JNIEnv * env, jclass clazz, jlong ptr, jint index) {

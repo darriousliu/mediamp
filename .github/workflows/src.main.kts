@@ -459,7 +459,10 @@ workflow(
         // Including: 
         // - pushing directly to main
         // - pushing to a branch that has an associated PR
-        Push(pathsIgnore = listOf("**/*.md")),
+        Push(
+            pathsIgnore = listOf("**/*.md"),
+            branchesIgnore = listOf("codex/mediamp-0.4.0-tao"),
+        ),
         PullRequest(pathsIgnore = listOf("**/*macosDmg.md")),
     ),
     sourceFile = __FILE__,

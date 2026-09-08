@@ -128,11 +128,17 @@ internal fun configureRuntimePublishing(
 ) {
     val deployVersion = context.project.version.toString()
     val runtimeTargets = context.desktopRuntimeTargets
+    val runtimeSources = context.project.tasks.register<Jar>("mpvRuntimeSourcesJar") {
+        archiveBaseName.set("mediamp-mpv-runtime")
+        archiveClassifier.set("sources")
+        from(context.project.layout.projectDirectory.dir("src/cpp")) { into("src/cpp") }
+        from(context.project.rootProject.file("LICENSE"))
+    }
 
     context.project.extensions.getByType<PublishingExtension>().publications.apply {
         desktopRuntimeJarTasks.forEach { (target, jarTask) ->
             create<MavenPublication>("mpvRuntime${target.publicationSuffix()}") {
-                groupId = "org.openani.mediamp"
+                groupId = context.project.group.toString()
                 artifactId = "mediamp-mpv-runtime-${target.artifactSuffix()}"
                 version = deployVersion
 
@@ -140,9 +146,10 @@ internal fun configureRuntimePublishing(
                     classifier = null
                     jarTask.builtBy?.let { builtBy(it) }
                 }
+                artifact(runtimeSources)
 
                 addCompilePomDependency(
-                    groupId = "org.openani.mediamp",
+                    groupId = context.project.group.toString(),
                     artifactId = "mediamp-mpv",
                     version = deployVersion,
                 )
@@ -162,22 +169,22 @@ internal fun configureRuntimePublishing(
 
     // 聚合工件 mediamp-mpv-runtime: 单一 JVM runtime variant, 依赖本次构建可发布的全部平台
     // runtime jar. 之前的属性化 per-OS variant 对普通 JVM 消费端会歧义 (consumer 不携带
-    // OS/arch 属性); fat 聚合零配置可用: runtimeOnly("org.openani.mediamp:mediamp-mpv-runtime")
+    // OS/arch 属性); fat 聚合零配置可用: runtimeOnly("${context.project.group}:mediamp-mpv-runtime")
     // 一行全平台通用 (loader 按平台化清单名取对应 natives). 关心分发体积的应用仍可按平台
     // 声明 mediamp-mpv-runtime-<os>-<arch>.
     if (desktopRuntimeJarTasks.isNotEmpty()) {
         val fatRuntimeVariant = context.project.createDependencyOnlyJvmRuntimeElements(
             configurationName = "mpvRuntimeAllElements",
             dependencyNotations = desktopRuntimeJarTasks.keys.map { target ->
-                "org.openani.mediamp:mediamp-mpv-runtime-${target.artifactSuffix()}:$deployVersion"
+                "${context.project.group}:mediamp-mpv-runtime-${target.artifactSuffix()}:$deployVersion"
             },
-            capabilityNotation = "org.openani.mediamp:mediamp-mpv-runtime:$deployVersion",
+            capabilityNotation = "${context.project.group}:mediamp-mpv-runtime:$deployVersion",
         )
 
         context.project.publishDesktopRuntimeAggregator(
             componentName = "mpvRuntimeElements",
             publicationName = "mpvRuntime",
-            groupId = "org.openani.mediamp",
+            groupId = context.project.group.toString(),
             artifactId = "mediamp-mpv-runtime",
             version = deployVersion,
             variantConfigurations = listOf(fatRuntimeVariant),
@@ -186,7 +193,7 @@ internal fun configureRuntimePublishing(
 
     context.project.wireDesktopRuntimeDependencyConstraints(
         runtimeTargets.map { target ->
-            "org.openani.mediamp:mediamp-mpv-runtime-${target.artifactSuffix()}:$deployVersion"
+            "${context.project.group}:mediamp-mpv-runtime-${target.artifactSuffix()}:$deployVersion"
         },
     )
 }

@@ -28,6 +28,7 @@ include(":mediamp-api")
 include(":mediamp-vlc-loader")
 include(":mediamp-exoplayer")
 include(":mediamp-mpv")
+include(":mediamp-mpv-tao")
 include(":mediamp-avkit")
 
 include(":mediamp-ffmpeg")

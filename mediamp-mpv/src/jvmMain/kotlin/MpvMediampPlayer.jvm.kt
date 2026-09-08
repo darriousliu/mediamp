@@ -524,7 +524,7 @@ abstract class JvmMpvMediampPlayer(
                 headers.remove("Referer")?.let { handle.option("referrer", it) }
                 val headerFields = headers.entries.joinToString(",") { (key, value) -> "$key: $value" }
                 handle.option("http-header-fields", headerFields)
-                data.uri
+                mpvUriLoadTarget(data.uri)
             }
 
             is SeekableInputMediaData -> {

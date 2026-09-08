@@ -141,7 +141,7 @@ internal fun configureRuntimePublishing(
     context.project.extensions.getByType<PublishingExtension>().publications.apply {
         desktopRuntimeJarTasks.forEach { (target, jarTask) ->
             create<MavenPublication>("ffmpegRuntime${target.publicationSuffix()}") {
-                groupId = "org.openani.mediamp"
+                groupId = context.project.group.toString()
                 artifactId = "mediamp-ffmpeg-runtime-${target.artifactSuffix()}"
                 version = deployVersion
 
@@ -151,7 +151,7 @@ internal fun configureRuntimePublishing(
                 }
 
                 addCompilePomDependency(
-                    groupId = "org.openani.mediamp",
+                    groupId = context.project.group.toString(),
                     artifactId = "mediamp-ffmpeg",
                     version = deployVersion,
                 )
@@ -161,7 +161,7 @@ internal fun configureRuntimePublishing(
 
         appleXcframeworkArtifact?.let { xcframeworkArtifact ->
             create<MavenPublication>("ffmpegRuntimeIosXcframework") {
-                groupId = "org.openani.mediamp"
+                groupId = context.project.group.toString()
                 artifactId = APPLE_XCFRAMEWORK_ARTIFACT_ID
                 version = deployVersion
 
@@ -187,7 +187,7 @@ internal fun configureRuntimePublishing(
     val allRuntimeVariants = runtimeTargets.map { target ->
         context.project.createDependencyOnlyDesktopRuntimeElements(
             configurationName = "ffmpegRuntimeElements-${target.artifactSuffix()}",
-            dependencyNotation = "org.openani.mediamp:mediamp-ffmpeg-runtime-${target.artifactSuffix()}:$deployVersion",
+            dependencyNotation = "${context.project.group}:mediamp-ffmpeg-runtime-${target.artifactSuffix()}:$deployVersion",
             target = target,
         )
     }
@@ -195,7 +195,7 @@ internal fun configureRuntimePublishing(
     context.project.publishDesktopRuntimeAggregator(
         componentName = "ffmpegRuntimeElements",
         publicationName = "ffmpegRuntime",
-        groupId = "org.openani.mediamp",
+        groupId = context.project.group.toString(),
         artifactId = "mediamp-ffmpeg-runtime",
         version = deployVersion,
         variantConfigurations = allRuntimeVariants,
@@ -203,7 +203,7 @@ internal fun configureRuntimePublishing(
 
     context.project.wireDesktopRuntimeDependencyConstraints(
         runtimeTargets.map { target ->
-            "org.openani.mediamp:mediamp-ffmpeg-runtime-${target.artifactSuffix()}:$deployVersion"
+            "${context.project.group}:mediamp-ffmpeg-runtime-${target.artifactSuffix()}:$deployVersion"
         },
     )
 }

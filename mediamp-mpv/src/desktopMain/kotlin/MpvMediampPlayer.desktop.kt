@@ -30,17 +30,44 @@ actual class MpvMediampPlayer(
     parentCoroutineContext: CoroutineContext,
     /**
      * The dispatcher the state machine is confined to (spec §4). Defaults to
-     * [Dispatchers.Main], which on desktop JVM is the Swing EDT. The machine captures the
+     * [Dispatchers.Main], supplied by the chosen AWT or TAO desktop host. The machine captures the
      * dispatcher's thread identity itself for the fail-fast command check.
      */
     mainDispatcher: CoroutineDispatcher = Dispatchers.Main,
+    /** Select before libmpv creates its producer context; TAO must not use AWT auto-detection. */
+    val desktopRenderBackend: MpvDesktopRenderBackend = MpvDesktopRenderBackend.AWT,
 ) : JvmMpvMediampPlayer(context, parentCoroutineContext, mainDispatcher) {
 
     // Native render path; the consumer state machine is chosen by the backend
     // (MpvSurfaceRing for the shared-texture rings, MpvReadbackSurface for the Windows
     // OpenGL fallback).
-    private val ringBackend: MpvSurfaceBackend? = currentSurfaceBackend()
+    internal val ringBackend: MpvSurfaceBackend? = desktopRenderBackend.resolve()
     private val surfaceRing: MpvSurfaceConsumer? = ringBackend?.createSurfaceConsumer(handle.ptr)
+    private var desktopSurfaceSession: MpvDesktopSurfaceSession? = null
+
+    /** Attaches a framework-provided GPU host without SkiaLayer or private Skiko reflection. */
+    @InternalMediampApi
+    fun attachDesktopSurface(host: MpvDesktopGpuHost, onFrameAvailable: () -> Unit): MpvDesktopSurfaceSession {
+        check(desktopRenderBackend != MpvDesktopRenderBackend.AWT) {
+            "Select an explicit desktopRenderBackend before attaching a non-AWT host"
+        }
+        check(desktopSurfaceSession == null) { "A player can render into only one desktop surface at a time" }
+        return MpvDesktopSurfaceSession(this, host, onFrameAvailable).also { desktopSurfaceSession = it }
+    }
+
+    internal fun desktopSurfaceDetached(session: MpvDesktopSurfaceSession) {
+        if (desktopSurfaceSession === session) desktopSurfaceSession = null
+    }
+
+    override fun closeImpl() {
+        // The native handle is destroyed on another thread by the superclass. Drop
+        // all host GPU references synchronously while that handle is still alive.
+        try {
+            desktopSurfaceSession?.close()
+        } finally {
+            super.closeImpl()
+        }
+    }
 
     /**
      * Producer-context lifecycle chosen by the backend: eager where the backend owns its
@@ -92,8 +119,8 @@ actual class MpvMediampPlayer(
     }
 
     /** See [MpvSurfaceConsumer.currentFrameImage]. Do NOT close the returned image. */
-    internal fun currentFrameImage(directContext: DirectContext): Image? =
-        surfaceRing?.currentFrameImage(directContext)
+    internal fun currentFrameImage(directContext: DirectContext, leasedFrameState: Long? = null): Image? =
+        surfaceRing?.currentFrameImage(directContext, leasedFrameState)
 
     /** See [MpvSurfaceConsumer.release]. */
     internal fun releaseSurface() {

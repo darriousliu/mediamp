@@ -15,6 +15,7 @@ import org.openani.mediamp.internal.IO_
 import org.openani.mediamp.io.SeekableInput
 import org.openani.mediamp.mpv.MPVHandle
 import org.openani.mediamp.mpv.RenderUpdateListener
+import org.openani.mediamp.mpv.mpvUriLoadTarget
 import org.openani.mediamp.source.MediaData
 import org.openani.mediamp.source.SeekableInputMediaData
 import org.openani.mediamp.source.UriMediaData
@@ -117,7 +118,7 @@ internal class MpvPreviewDecoder(
                 headers.remove("Referer")?.let { handle.option("referrer", it) }
                 val headerFields = headers.entries.joinToString(",") { (key, value) -> "$key: $value" }
                 handle.option("http-header-fields", headerFields)
-                data.uri
+                mpvUriLoadTarget(data.uri)
             }
 
             is SeekableInputMediaData -> {
@@ -141,8 +142,15 @@ internal class MpvPreviewDecoder(
         handle.setRenderUpdateListener(listener)
 
     /** See [MpvSurfaceBackend.setSurfaceConfig]; the preview ring is always headless. */
-    fun requestSurface(width: Int, height: Int): Boolean =
-        ringBackend.setSurfaceConfig(handle.ptr, width, height, 0L)
+    fun requestSurface(width: Int, height: Int): Boolean {
+        // A preview never imports a TAO shared handle. Retire skipped generations
+        // explicitly so repeated thumbnail-size changes cannot block the producer.
+        if (ringBackend === D3D11TaoSurfaceBackend) {
+            val retired = D3D11TaoSurfaceBackend.retiredGeneration(handle.ptr)
+            if (retired >= 0) D3D11TaoSurfaceBackend.acknowledge(handle.ptr, retired)
+        }
+        return ringBackend.setSurfaceConfig(handle.ptr, width, height, 0L)
+    }
 
     /** See [MpvSurfaceBackend.readSurfacePixels]. */
     fun readSurfacePixels(dims: IntArray): IntArray? =
