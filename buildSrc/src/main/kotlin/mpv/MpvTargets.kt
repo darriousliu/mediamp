@@ -503,6 +503,8 @@ internal fun MpvBuildContext.androidTarget(abi: AndroidAbi): MpvBuildTarget {
             "-Dandroid-media-ndk=enabled",
             // Android artifacts need the library, not host gtk-doc/DocBook tooling.
             "-Dharfbuzz:docs=disabled",
+            // libass checkasm is a test executable; NASM cannot build Android PIE executables.
+            "-Dlibass:checkasm=disabled",
             "-Dlibass:require-system-font-provider=false",
             "-Dlibplacebo:vulkan=disabled",
             "-Dlibplacebo:lcms=disabled",
