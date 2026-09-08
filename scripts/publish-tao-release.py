@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Freeze a desktop Maven closure, publish once, and verify every remote file.
+"""Freeze all declared MediaMP publications and verify their complete closure.
 
-The default release contains macOS arm64 natives only. Additional runtime
-coordinates must be selected explicitly with --native-platform and already be
-present in staging. No aggregate or mobile publication is synthesized here.
-Secrets are read from the environment, never from command-line arguments.
+The checked-in inventory includes Android, iOS, Wasm, JVM, all five desktop
+runtime targets, and the FFmpeg XCFramework. Secrets are read only from env.
 """
 
 import argparse
 import base64
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -27,12 +28,13 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 
-GROUP = "io.github.darriousliu.mediamp"
+ROOT = Path(__file__).resolve().parents[1]
+INVENTORY = json.loads((Path(__file__).with_name("tao-publications.json")).read_text())
+GROUP = INVENTORY["group"]
 GROUP_PATH = GROUP.replace(".", "/")
-CORE = ("mediamp-api", "mediamp-internal-utils", "mediamp-native-loader", "mediamp-mpv")
 CENTRAL_API = "https://central.sonatype.com/api/v1/publisher"
 CENTRAL_REPOSITORY = "https://repo.maven.apache.org/maven2"
-SUPPORTED_NATIVE = ("macos-arm64", "windows-x64", "windows-arm64", "macos-x64")
+SUPPORTED_NATIVE = tuple(INVENTORY["nativePlatforms"])
 SECRET_NAMES = (
     "ORG_GRADLE_PROJECT_mavenCentralUsername",
     "ORG_GRADLE_PROJECT_mavenCentralPassword",
@@ -62,13 +64,49 @@ def digest(data, algorithm="sha256"):
     return hashlib.new(algorithm, data).hexdigest()
 
 
-def coordinates(platforms):
-    return [*CORE, *(name + "-desktop" for name in CORE), "mediamp-mpv-tao",
-            *("mediamp-mpv-runtime-" + platform for platform in platforms)]
+def publication_specs():
+    specs = {}
+    for module, targets in INVENTORY["multiplatform"].items():
+        specs[module] = "metadata"
+        for target in targets:
+            specs[f"{module}-{target}"] = {
+                "android": "android", "desktop": "jvm", "iosarm64": "native",
+                "iossimulatorarm64": "native", "wasm-js": "wasm",
+            }[target]
+    specs.update(INVENTORY["standalone"])
+    for family in INVENTORY["nativeFamilies"]:
+        specs[f"mediamp-{family}-runtime"] = "aggregate"
+        for platform in SUPPORTED_NATIVE:
+            specs[f"mediamp-{family}-runtime-{platform}"] = "runtime"
+    specs[INVENTORY["xcframework"]] = "xcframework"
+    return specs
+
+
+def coordinates(platforms=None):
+    if platforms is not None and (len(platforms) != len(SUPPORTED_NATIVE) or set(platforms) != set(SUPPORTED_NATIVE)):
+        raise ReleaseError("A full release requires every native platform in tao-publications.json.")
+    return list(publication_specs())
+
+
+def primary_extension(kind):
+    return {"metadata": ".jar", "jvm": ".jar", "android": ".aar", "native": ".klib",
+            "wasm": ".klib", "runtime": ".jar", "xcframework": ".zip", "catalog": ".toml",
+            "aggregate": ".pom"}[kind]
+
+
+def required_suffixes(kind):
+    required = {".pom", primary_extension(kind)}
+    if kind not in ("runtime", "xcframework"):
+        required.add(".module")
+    if kind != "catalog":
+        required.add("-javadoc.jar")
+    if kind in ("metadata", "jvm", "android", "native", "wasm"):
+        required.add("-sources.jar")
+    return required
 
 
 def jni_source_hash():
-    source = Path(__file__).resolve().parents[1] / "mediamp-mpv/src/cpp"
+    source = ROOT / "mediamp-mpv/src/cpp"
     checksum = hashlib.sha256()
     for path in sorted(source.rglob("*")):
         if path.is_file():
@@ -84,16 +122,20 @@ def validate_module(path, expected, version):
         raise ReleaseError(f"Unexpected Gradle module coordinates: {path.name}")
     for variant in module.get("variants", []):
         target = variant.get("available-at")
-        if target and variant["name"].startswith("desktop"):
+        if target:
             if target.get("group") != GROUP or target.get("module") not in expected or target.get("version") != version:
-                raise ReleaseError(f"Unpublished desktop variant in {path.name}")
-        for dependency in variant.get("dependencies", []):
+                raise ReleaseError(f"Unpublished platform variant in {path.name}")
+            redirected = (path.parent / target["url"]).resolve()
+            wanted = path.parent.parent.parent / target["module"] / version / f"{target['module']}-{version}.module"
+            if redirected != wanted.resolve() or not redirected.is_file():
+                raise ReleaseError(f"Broken available-at URL in {path.name}")
+        for dependency in variant.get("dependencies", []) + variant.get("dependencyConstraints", []):
             if dependency.get("group") == "org.openani.mediamp":
                 raise ReleaseError(f"Fork metadata still depends on the upstream namespace: {path.name}")
             if dependency.get("group") != GROUP:
                 continue
             dep_version = dependency.get("version", {})
-            if dependency.get("module") not in expected or dep_version.get("requires") != version:
+            if dependency.get("module") not in expected or dep_version.get("requires", dep_version.get("strictly")) != version:
                 raise ReleaseError(f"Unpublished Gradle dependency in {path.name}")
         for artifact in variant.get("files", []):
             relative = Path(artifact["url"])
@@ -104,24 +146,176 @@ def validate_module(path, expected, version):
                 raise ReleaseError(f"Gradle metadata checksum mismatch in {path.name}: {relative}")
 
 
+def validate_elf(data, abi, label):
+    expected = {"armeabi-v7a": (1, 40), "arm64-v8a": (2, 183), "x86": (1, 3), "x86_64": (2, 62)}[abi]
+    if len(data) < 20 or data[:4] != b"\x7fELF" or data[5] != 1:
+        raise ReleaseError(f"Missing ELF binary: {label}")
+    if (data[4], int.from_bytes(data[18:20], "little")) != expected:
+        raise ReleaseError(f"Wrong ELF architecture: {label}")
+
+
+def validate_android(archive, artifact):
+    wrappers = {"mediamp-mpv-android": "libmediampv.so", "mediamp-ffmpeg-android": "libffmpegkitjni.so",
+                "mediamp-exoplayer-android": "libmediamp_wsola.so"}
+    if artifact not in wrappers:
+        return
+    for abi in INVENTORY["androidAbis"]:
+        name = f"jni/{abi}/{wrappers[artifact]}"
+        if name not in archive.namelist():
+            raise ReleaseError(f"Android native backend is missing: {artifact}/{name}")
+        validate_elf(archive.read(name), abi, f"{artifact}/{name}")
+        if artifact != "mediamp-exoplayer-android":
+            libraries = ["libavcodec.so", "libavformat.so", "libavutil.so"]
+            if artifact == "mediamp-mpv-android":
+                libraries += ["libmpv.so", "libc++_shared.so"]
+            for library in libraries:
+                dependency = f"jni/{abi}/{library}"
+                if dependency not in archive.namelist():
+                    raise ReleaseError(f"Android codec dependency is missing: {artifact}/{dependency}")
+                validate_elf(archive.read(dependency), abi, f"{artifact}/{dependency}")
+    if artifact == "mediamp-exoplayer-android":
+        import io
+        with zipfile.ZipFile(io.BytesIO(archive.read("classes.jar"))) as classes:
+            license_path = "META-INF/licenses/org.openani.mediamp/mediamp-exoplayer/scaletempo2.txt"
+            if license_path not in classes.namelist():
+                raise ReleaseError("ExoPlayer AAR is missing the scaletempo2 license.")
+
+
+def validate_xcframework(archive):
+    info_names = [name for name in archive.namelist() if name.endswith(".xcframework/Info.plist")]
+    if len(info_names) != 1:
+        raise ReleaseError("Expected one FFmpeg XCFramework Info.plist.")
+    root = info_names[0].removesuffix("Info.plist")
+    info = plistlib.loads(archive.read(info_names[0]))
+    variants = set()
+    for library in info.get("AvailableLibraries", []):
+        if library.get("SupportedPlatform") != "ios" or "arm64" not in library.get("SupportedArchitectures", []):
+            continue
+        variants.add(library.get("SupportedPlatformVariant", "device"))
+        prefix = root + library["LibraryIdentifier"] + "/" + library["LibraryPath"].rstrip("/") + "/"
+        if not any(name.startswith(prefix) and name.endswith("MediampFFmpegKit") and archive.getinfo(name).file_size > 0
+                   for name in archive.namelist()):
+            raise ReleaseError("FFmpeg XCFramework slice is missing its linked library.")
+    if variants != {"device", "simulator"}:
+        raise ReleaseError("FFmpeg XCFramework must include arm64 iOS device and simulator slices.")
+
+
+def validate_runtime(archive, artifact, version, already_published=False):
+    family = "mpv" if artifact.startswith("mediamp-mpv-") else "ffmpeg"
+    platform = artifact.removeprefix(f"mediamp-{family}-runtime-")
+    provenance = dict(line.split("=", 1) for line in
+                      archive.read("META-INF/mediamp-tao-native-build.txt").decode().splitlines() if "=" in line)
+    if provenance.get("version") != version or provenance.get("base-runtime") != "0.4.0":
+        raise ReleaseError(f"Unverified native runtime provenance: {artifact}")
+    if family == "mpv" and not already_published and provenance.get("jni-source-sha256") != jni_source_hash():
+        raise ReleaseError(f"Native runtime does not match this checkout's JNI source: {artifact}")
+    if family == "ffmpeg":
+        # Imported lazily because the helper also supports platform build commands.
+        from tao_runtime import ffmpeg_compatibility_source_hash
+        if provenance.get("jni") != "reused-upstream-unchanged" or provenance.get("compatibility-source-sha256") != ffmpeg_compatibility_source_hash():
+            raise ReleaseError(f"FFmpeg native provenance does not match the verified upstream sources: {artifact}")
+    manifest_name = f"mpv-natives-{platform}.txt" if family == "mpv" else "ffmpeg-natives.txt"
+    if manifest_name not in archive.namelist():
+        raise ReleaseError(f"Missing platform native manifest: {artifact}")
+    libraries = [line.strip() for line in archive.read(manifest_name).decode().splitlines() if line.strip()]
+    for name in libraries:
+        if Path(name).is_absolute() or ".." in Path(name).parts or name not in archive.namelist() or archive.getinfo(name).file_size == 0:
+            raise ReleaseError(f"Broken native dependency manifest: {artifact}/{name}")
+    wrapper = {"mpv": {"windows": "mediampv.dll", "macos": "libmediampv.dylib", "linux": "libmediampv.so"},
+               "ffmpeg": {"windows": "ffmpegkitjni.dll", "macos": "libffmpegkitjni.dylib", "linux": "libffmpegkitjni.so"}}[family][platform.split("-")[0]]
+    if not any(Path(name).name == wrapper for name in libraries):
+        raise ReleaseError(f"Native runtime manifest omits its JNI wrapper: {artifact}")
+    if not already_published:
+        from tao_runtime import BASE_SHA256
+        wrappers = [name for name in libraries if Path(name).name == wrapper]
+        if provenance.get("base-sha256") != BASE_SHA256[family][platform]:
+            raise ReleaseError(f"Native runtime has the wrong verified upstream input: {artifact}")
+        if len(wrappers) != 1 or provenance.get("jni-binary-sha256") != digest(archive.read(wrappers[0])):
+            raise ReleaseError(f"Native runtime JNI binary checksum mismatch: {artifact}")
+
+
+def validate_catalog(path, expected, version):
+    catalog = tomllib.loads(path.read_text())
+    versions = catalog.get("versions", {})
+    for alias, library in catalog.get("libraries", {}).items():
+        group, module = library["module"].split(":") if "module" in library else (library["group"], library["name"])
+        selected_version = library.get("version")
+        if isinstance(selected_version, dict):
+            selected_version = versions.get(selected_version.get("ref"))
+        if group != GROUP or module not in expected or selected_version != version:
+            raise ReleaseError(f"Catalog alias points outside the complete fork release: {alias}")
+
+
 def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-def freeze(staging, output, version, platforms):
+ARTIFACT_EXTENSIONS = {".jar", ".aar", ".klib", ".zip", ".toml", ".pom", ".module", ".json"}
+
+
+class DirectoryLinks(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.links += [value for key, value in attrs if key == "href"]
+
+
+def overlay_existing(staging, output, version, expected):
+    """Copy into an isolated tree and replace existing GAVs with Central's exact files."""
+    resolved = output / "resolved-staging"
+    existing = []
+    remote_hashes = {}
+    for artifact in expected:
+        relative = Path(GROUP_PATH) / artifact / version
+        target = resolved / relative
+        target.mkdir(parents=True, exist_ok=True)
+        prefix = f"{artifact}-{version}"
+        base = CENTRAL_REPOSITORY + "/" + relative.as_posix()
+        try:
+            pom = request(base + "/" + prefix + ".pom")
+        except HTTPError as error:
+            status = error.code
+            error.close()
+            if status != 404:
+                raise ReleaseError(f"Cannot inspect existing {artifact}: HTTP {status}") from None
+            source = staging / relative
+            if not source.is_dir():
+                raise ReleaseError(f"Missing unpublished staged coordinate: {artifact}")
+            shutil.copytree(source, target, dirs_exist_ok=True)
+            continue
+        links = DirectoryLinks()
+        links.feed(request(base + "/").decode())
+        files = [name for name in links.links if name.startswith(prefix) and "/" not in name
+                 and Path(name).suffix in ARTIFACT_EXTENSIONS]
+        if prefix + ".pom" not in files:
+            raise ReleaseError(f"Cannot enumerate the immutable Central files for {artifact}")
+        for name in files:
+            data = pom if name == prefix + ".pom" else request(base + "/" + quote(name))
+            (target / name).write_bytes(data)
+            remote_hashes[(relative / name).as_posix()] = digest(data)
+        existing.append(artifact)
+    write_json(output / "existing-central-files.json", remote_hashes)
+    return resolved, existing, remote_hashes
+
+
+def freeze(staging, output, version, platforms=None, supplement_existing=False):
     if (output / "payload").exists():
         raise ReleaseError("Output already contains a payload; use a fresh output directory.")
     expected = coordinates(platforms)
-    expected_jni_hash = jni_source_hash()
+    specs = publication_specs()
     output.mkdir(parents=True, exist_ok=True)
+    existing, existing_hashes = [], {}
+    if supplement_existing:
+        staging, existing, existing_hashes = overlay_existing(staging, output, version, expected)
     records = {}
     for artifact in expected:
         relative = Path(GROUP_PATH) / artifact / version
         source = staging / relative
         prefix = f"{artifact}-{version}"
-        required = [prefix + ".pom", prefix + ".jar", prefix + "-javadoc.jar", prefix + "-sources.jar"]
-        if not artifact.startswith("mediamp-mpv-runtime-"):
-            required += [prefix + ".module"]
+        required = [prefix + suffix for suffix in required_suffixes(specs[artifact])]
         for name in required:
             if not (source / name).is_file():
                 raise ReleaseError(f"Incomplete staging: missing {relative / name}")
@@ -130,8 +324,11 @@ def freeze(staging, output, version, platforms):
         for field, wanted in (("groupId", GROUP), ("artifactId", artifact), ("version", version)):
             if pom.findtext("m:" + field, namespaces=ns) != wanted:
                 raise ReleaseError(f"Unexpected POM {field}: {relative}")
-        for dependency in pom.findall("m:dependencies/m:dependency", ns):
-            if dependency.findtext("m:groupId", namespaces=ns) != GROUP:
+        for dependency in pom.findall(".//m:dependency", ns):
+            dep_group = dependency.findtext("m:groupId", namespaces=ns)
+            if dep_group == "org.openani.mediamp":
+                raise ReleaseError(f"Fork POM still depends on the upstream namespace: {artifact}")
+            if dep_group != GROUP:
                 continue
             dep_artifact = dependency.findtext("m:artifactId", namespaces=ns)
             dep_version = dependency.findtext("m:version", namespaces=ns)
@@ -139,47 +336,52 @@ def freeze(staging, output, version, platforms):
                 raise ReleaseError(f"Unpublished dependency in {artifact}: {dep_artifact}:{dep_version}")
         for path in sorted(source.iterdir()):
             # Ignore Maven-local bookkeeping, stale signatures and regenerated checksums.
-            if not path.name.startswith(prefix) or path.suffix not in (".jar", ".pom", ".module", ".json"):
+            if not path.name.startswith(prefix) or path.suffix not in ARTIFACT_EXTENSIONS:
                 continue
             if path.is_symlink() or not path.is_file():
                 raise ReleaseError(f"Unexpected staged file: {path.name}")
             data = path.read_bytes()
             if path.suffix == ".module":
                 validate_module(path, expected, version)
-            if path.suffix == ".jar":
+            if path.suffix == ".toml":
+                validate_catalog(path, expected, version)
+            if path.suffix in (".jar", ".aar", ".klib", ".zip"):
                 with zipfile.ZipFile(path) as archive:
                     if archive.testzip() is not None:
-                        raise ReleaseError(f"Corrupt JAR: {path.name}")
-                    if artifact.startswith("mediamp-mpv-runtime-") and path.name == prefix + ".jar":
-                        provenance = dict(
-                            line.split("=", 1)
-                            for line in archive.read("META-INF/mediamp-tao-native-build.txt").decode().splitlines()
-                            if "=" in line
-                        )
-                        if provenance.get("version") != version or provenance.get("base-runtime") != "0.4.0":
-                            raise ReleaseError(f"Unverified native runtime provenance: {artifact}")
-                        if provenance.get("jni-source-sha256") != expected_jni_hash:
-                            raise ReleaseError(f"Native runtime does not match this checkout's JNI source: {artifact}")
-                        platform = artifact.removeprefix("mediamp-mpv-runtime-")
-                        if f"mpv-natives-{platform}.txt" not in archive.namelist():
-                            raise ReleaseError(f"Missing platform native manifest: {artifact}")
+                        raise ReleaseError(f"Corrupt archive: {path.name}")
+                    if specs[artifact] == "runtime" and path.name == prefix + ".jar":
+                        validate_runtime(archive, artifact, version, artifact in existing)
+                    if path.suffix == ".aar":
+                        validate_android(archive, artifact)
+                    if specs[artifact] == "xcframework" and path.name == prefix + ".zip":
+                        validate_xcframework(archive)
             target = output / "payload" / relative / path.name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             records[target.relative_to(output / "payload").as_posix()] = digest(data)
     write_json(output / "manifest.json", {
-        "version": version, "group": GROUP, "nativePlatforms": platforms,
+        "version": version, "group": GROUP, "nativePlatforms": list(SUPPORTED_NATIVE),
         "coordinates": expected, "sha256": records,
+        "supplementExisting": supplement_existing, "existingCoordinates": existing,
+        "existingSha256": existing_hashes,
+        "uploadCoordinates": [name for name in expected if name not in existing],
     })
-    print(f"Frozen {len(expected)} coordinates, {len(records)} files; natives: {', '.join(platforms)}")
+    print(f"Frozen {len(expected)} coordinates, {len(records)} files; "
+          f"{len(existing)} immutable Central coordinates retained, {len(expected) - len(existing)} to upload.")
 
 
-def checked_manifest(output, version, platforms):
+def checked_manifest(output, version, platforms=None, supplement_existing=False):
     manifest = json.loads((output / "manifest.json").read_text())
-    if manifest["version"] != version or manifest["nativePlatforms"] != platforms:
+    coordinates(platforms)
+    if manifest["version"] != version or manifest["nativePlatforms"] != list(SUPPORTED_NATIVE):
         raise ReleaseError("Frozen manifest does not match the requested version/platforms.")
-    if manifest["coordinates"] != coordinates(platforms):
+    if manifest["coordinates"] != coordinates() or manifest["supplementExisting"] != supplement_existing:
         raise ReleaseError("Frozen coordinate set has changed.")
+    existing, uploads = set(manifest["existingCoordinates"]), set(manifest["uploadCoordinates"])
+    if existing & uploads or existing | uploads != set(coordinates()):
+        raise ReleaseError("Invalid existing/upload coordinate partition.")
+    if manifest["existingSha256"] != records_for_coordinates(manifest, existing):
+        raise ReleaseError("Immutable Central file evidence does not match the frozen payload.")
     for relative, wanted in manifest["sha256"].items():
         path = Path(relative)
         if path.is_absolute() or ".." in path.parts:
@@ -222,19 +424,29 @@ def verify_remote(base, records, headers, wait_seconds=0):
         time.sleep(15)
 
 
-def central_already_published(manifest):
-    probes = []
-    for artifact in manifest["coordinates"]:
+def records_for_coordinates(manifest, selected):
+    selected = set(selected)
+    return {relative: sha for relative, sha in manifest["sha256"].items()
+            if Path(relative).parts[-3] in selected}
+
+
+def pending_central_coordinates(manifest):
+    """Recheck immutable originals and skip complete, byte-identical resumed uploads."""
+    verify_remote(CENTRAL_REPOSITORY, manifest["existingSha256"], {})
+    pending = []
+    specs = publication_specs()
+    for artifact in manifest["uploadCoordinates"]:
         prefix = f"{GROUP_PATH}/{artifact}/{manifest['version']}/{artifact}-{manifest['version']}"
-        probes += [prefix + ".pom", prefix + ".jar"]
-    present = [remote_matches(CENTRAL_REPOSITORY, relative, manifest["sha256"][relative], {})
-               for relative in probes]
-    if not any(present):
-        return False
-    if not all(present):
-        raise ReleaseError("Central already contains a partial release of this version; no upload or fallback attempted.")
-    verify_remote(CENTRAL_REPOSITORY, manifest["sha256"], {})
-    return True
+        probes = sorted({prefix + ".pom", prefix + primary_extension(specs[artifact])})
+        present = [remote_matches(CENTRAL_REPOSITORY, relative, manifest["sha256"][relative], {})
+                   for relative in probes]
+        if any(present) and not all(present):
+            raise ReleaseError(f"Central contains incomplete files for {artifact}; no upload or fallback attempted.")
+        if all(present):
+            verify_remote(CENTRAL_REPOSITORY, records_for_coordinates(manifest, [artifact]), {})
+        else:
+            pending.append(artifact)
+    return pending
 
 
 def sign_payload(output, manifest):
@@ -287,12 +499,18 @@ def publish_central(output, records, authorization):
         for relative in records:
             archive.write(output / "payload" / relative, relative)
     boundary = "tao-" + uuid.uuid4().hex
-    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"bundle\"; "
-            f"filename=\"central-bundle.zip\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode()
-    body += bundle.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
-    headers = {"Authorization": authorization, "Content-Type": "multipart/form-data; boundary=" + boundary}
+    multipart = output / "central-upload.multipart"
+    with multipart.open("wb") as body:
+        body.write((f"--{boundary}\r\nContent-Disposition: form-data; name=\"bundle\"; "
+                    f"filename=\"central-bundle.zip\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode())
+        with bundle.open("rb") as source:
+            shutil.copyfileobj(source, body)
+        body.write(f"\r\n--{boundary}--\r\n".encode())
+    headers = {"Authorization": authorization, "Content-Type": "multipart/form-data; boundary=" + boundary,
+               "Content-Length": str(multipart.stat().st_size)}
     try:
-        deployment = request(CENTRAL_API + "/upload?publishingType=AUTOMATIC", "POST", body, headers).decode().strip()
+        with multipart.open("rb") as body:
+            deployment = request(CENTRAL_API + "/upload?publishingType=AUTOMATIC", "POST", body, headers).decode().strip()
     except HTTPError as error:
         details = safe_message(error.read(8192).decode(errors="replace"))[:4000]
         status = error.code
@@ -302,6 +520,8 @@ def publish_central(output, records, authorization):
         if 400 <= status < 500 and status != 408:
             raise CentralRejected(message) from None
         raise ReleaseError(message + "; upload state is uncertain, no fallback attempted.") from None
+    finally:
+        multipart.unlink(missing_ok=True)
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", deployment):
         raise ReleaseError("Central returned an unexpected upload result; publication state is unknown.")
     write_json(output / "central-deployment.json", {"deploymentId": deployment, "state": "PENDING"})
@@ -350,15 +570,20 @@ def publish_packages(output, records, repository):
 
 
 def publish(output, manifest, repository):
-    if central_already_published(manifest):
+    pending = pending_central_coordinates(manifest)
+    if not pending:
+        verify_remote(CENTRAL_REPOSITORY, manifest["sha256"], {})
         record_success(output, manifest, "Maven Central", CENTRAL_REPOSITORY, already_published=True)
         return
     username = os.environ.get("ORG_GRADLE_PROJECT_mavenCentralUsername", "")
     password = os.environ.get("ORG_GRADLE_PROJECT_mavenCentralPassword", "")
     if not username.strip() or not password.strip():
         raise ReleaseError("Central credentials are missing; no Central request or Packages fallback was attempted.")
-    sign_payload(output, manifest)
-    records = all_publication_files(output, manifest)
+    pending_manifest = {**manifest, "sha256": records_for_coordinates(manifest, pending)}
+    write_json(output / "upload-plan.json", {"coordinates": pending, "sha256": pending_manifest["sha256"],
+               "retainedCentralCoordinates": [name for name in manifest["coordinates"] if name not in pending]})
+    sign_payload(output, pending_manifest)
+    records = all_publication_files(output, pending_manifest)
     write_json(output / "publication-files.json", records)
     authorization = "Bearer " + base64.b64encode(f"{username}:{password}".encode()).decode()
     fallback_reason = None
@@ -371,17 +596,29 @@ def publish(output, manifest, repository):
         print("Central explicitly rejected the publication; publishing the same frozen files to GitHub Packages.")
         repository_url = publish_packages(output, records, repository)
         backend = "GitHub Packages"
-    record_success(output, manifest, backend, repository_url, fallback_reason)
+    retained = records_for_coordinates(manifest, [name for name in manifest["coordinates"] if name not in pending])
+    verify_remote(CENTRAL_REPOSITORY, retained, {})
+    if backend == "Maven Central":
+        verify_remote(CENTRAL_REPOSITORY, manifest["sha256"], {}, wait_seconds=600)
+    record_success(output, manifest, backend, repository_url, fallback_reason, uploaded_coordinates=pending)
 
 
-def record_success(output, manifest, backend, repository_url, fallback_reason=None, already_published=False):
+def record_success(output, manifest, backend, repository_url, fallback_reason=None, already_published=False,
+                   uploaded_coordinates=None):
+    uploaded = uploaded_coordinates or []
+    retained = [name for name in manifest["coordinates"] if name not in uploaded]
     result = {"version": manifest["version"], "backend": backend, "repository": repository_url,
               "nativePlatforms": manifest["nativePlatforms"], "coordinates": manifest["coordinates"],
-              "verified": True, "fallbackReason": fallback_reason, "alreadyPublished": already_published}
+              "verified": True, "fallbackReason": fallback_reason, "alreadyPublished": already_published,
+              "uploadedCoordinates": uploaded, "uploadedCount": len(uploaded),
+              "retainedCentralCoordinates": retained, "retainedCentralCount": len(retained),
+              "resumedCoordinates": [name for name in retained if name not in manifest["existingCoordinates"]]}
     write_json(output / "result.json", result)
-    message = (f"Published and verified {len(manifest['coordinates'])} coordinates to {backend}. "
+    message = (f"Verified the complete {len(manifest['coordinates'])}-coordinate release. "
+               f"Uploaded {len(uploaded)} coordinates to {backend}; retained {len(retained)} unchanged on Maven Central. "
                f"Native platforms: {', '.join(manifest['nativePlatforms'])}. "
-               "This is a desktop-only publication; no mobile or all-platform runtime release is implied.")
+               "Includes Android, iOS, Wasm, JVM, both runtime aggregators and the FFmpeg XCFramework. "
+               "Native publication coverage does not imply TAO window support on Linux.")
     print(message)
     if "GITHUB_STEP_SUMMARY" in os.environ:
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
@@ -395,22 +632,24 @@ def main():
     parser.add_argument("--staging", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--native-platform", action="append", choices=SUPPORTED_NATIVE, required=True)
+    parser.add_argument("--native-platform", action="append", choices=SUPPORTED_NATIVE)
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "darriousliu/mediamp"))
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--supplement-existing", action="store_true",
+                        help="Preserve exact Central files and upload only coordinates not already published.")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+-tao(?:[.-][A-Za-z0-9.-]+)?", args.version):
         parser.error("Only explicit -tao release versions are accepted.")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("Expected a GitHub owner/repository name.")
-    if len(set(args.native_platform)) != len(args.native_platform):
+    if args.native_platform is not None and len(set(args.native_platform)) != len(args.native_platform):
         parser.error("Duplicate native platforms are not allowed.")
     if args.prepare_only:
         if args.staging is None:
             parser.error("--prepare-only requires --staging.")
-        freeze(args.staging, args.output, args.version, args.native_platform)
+        freeze(args.staging, args.output, args.version, args.native_platform, args.supplement_existing)
     else:
-        manifest = checked_manifest(args.output, args.version, args.native_platform)
+        manifest = checked_manifest(args.output, args.version, args.native_platform, args.supplement_existing)
         publish(args.output, manifest, args.repository)
 
 

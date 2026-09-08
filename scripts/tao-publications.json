@@ -1,0 +1,20 @@
+{
+  "group": "io.github.darriousliu.mediamp",
+  "nativePlatforms": ["windows-x64", "windows-arm64", "linux-x64", "macos-arm64", "macos-x64"],
+  "androidAbis": ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"],
+  "multiplatform": {
+    "mediamp-api": ["android", "desktop", "iosarm64", "iossimulatorarm64", "wasm-js"],
+    "mediamp-internal-utils": ["android", "desktop", "iosarm64", "iossimulatorarm64"],
+    "mediamp-native-loader": ["android", "desktop", "iosarm64", "iossimulatorarm64"],
+    "mediamp-mpv": ["android", "desktop", "iosarm64", "iossimulatorarm64"],
+    "mediamp-ffmpeg": ["android", "desktop", "iosarm64", "iossimulatorarm64"],
+    "mediamp-all": ["android", "desktop", "iosarm64", "iossimulatorarm64", "wasm-js"],
+    "mediamp-source-ktxio": ["android", "desktop", "iosarm64", "iossimulatorarm64", "wasm-js"],
+    "mediamp-test": ["android", "desktop", "iosarm64", "iossimulatorarm64", "wasm-js"],
+    "mediamp-avkit": ["iosarm64", "iossimulatorarm64"],
+    "mediamp-exoplayer": ["android"]
+  },
+  "standalone": {"mediamp-mpv-tao": "jvm", "mediamp-vlc-loader": "jvm", "catalog": "catalog"},
+  "nativeFamilies": ["mpv", "ffmpeg"],
+  "xcframework": "mediamp-ffmpeg-runtime-ios-xcframework"
+}

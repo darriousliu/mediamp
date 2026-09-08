@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild Windows x64 TAO JNI over the verified official mpv/FFmpeg runtime.
+"""Rebuild Windows x64/arm64 TAO JNI over the verified official mpv/FFmpeg runtime.
 
 On a windows-2022 runner, set JAVA_HOME to a Windows x64 JDK and install MSYS2
 UCRT64 packages mingw-w64-ucrt-x86_64-gcc and mingw-w64-ucrt-x86_64-python.
@@ -7,6 +7,10 @@ Run using native Windows Python (the UCRT64 Python also works), for example:
 
     python scripts/prepare-tao-windows-runtime.py --msys2-dir C:/msys64 \
         --base-runtime-jar path/to/mediamp-mpv-runtime-windows-x64-0.4.0.jar
+
+For native Windows arm64 use windows-11-arm, ARM64 Python/JDK, MSYS2
+CLANGARM64 packages mingw-w64-clang-aarch64-clang, lld, llvm, libc++ and libunwind.
+ARM64 imports are generated from the exact runtime DLL exports with llvm-dlltool.
 
 Git and the mpv/FFmpeg submodules are required. Public mpv headers are exported
 from the submodule's committed HEAD, then the repository's render_d3d11.patch is
@@ -31,9 +35,9 @@ import tempfile
 import zipfile
 
 
-BASE_VERSION = "0.4.0"
-BASE_SHA256 = "abe3b9fc6553a252d3d92f3e62494fe59adca46ba79f898c8f7ac298561ee0b3"
-ROOT = Path(__file__).resolve().parents[1]
+from tao_runtime import (ROOT, extract_base as extract_verified_base, fork_version,
+                         package_runtime, mpv_jni_exports, sha256, tree_hash,
+                         verify_binary_arch, verify_runtime_manifest, verify_mpv_codec_inputs, write_provenance)
 TAO_METHODS = (
     "nCreateRenderContextTaoD3D11",
     "nSetSurfaceConfigTaoD3D11",
@@ -92,27 +96,11 @@ int wmain(int argc, wchar_t **argv) {
         std::fprintf(stderr, "Packaged mpv initialization failed: %d\n", rc);
         return 7;
     }
-    std::printf("Verified 5 TAO JNI exports; mpv initialized; client API=%lu\n", api());
+    std::printf("Verified all JNI exports; mpv initialized; client API=%lu\n", api());
     FreeLibrary(jni);
     return 0;
 }
 '''
-
-
-def extract_base(base, destination):
-    """Verify before extracting, and keep every codec byte unchanged."""
-    if hashlib.sha256(base.read_bytes()).hexdigest() != BASE_SHA256:
-        raise ValueError(f"Expected official Windows x64 runtime {BASE_VERSION} SHA-256 {BASE_SHA256}")
-    with zipfile.ZipFile(base) as archive:
-        for entry in archive.infolist():
-            relative = PurePosixPath(entry.filename)
-            if (relative.is_absolute() or ".." in relative.parts
-                    or "\\" in entry.filename or ":" in entry.filename):
-                raise ValueError(f"Invalid archive path: {entry.filename}")
-            if not entry.is_dir():
-                target = destination.joinpath(*relative.parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(archive.read(entry))
 
 
 def run(command, env, **kwargs):
@@ -148,113 +136,122 @@ def prepare_mpv_headers(mpv_source, patch, destination, env):
     return include_dir
 
 
+def make_arm64_import_library(dll, compiler_bin, scratch, env):
+    # lld does not share GNU ld's direct-DLL-input contract. Generate import
+    # libraries from the exact verified runtime's exports instead.
+    output = run([compiler_bin / "llvm-readobj.exe", "--coff-exports", dll], env,
+                 capture_output=True, text=True).stdout
+    names = re.findall(r"^\s+Name: (\S+)\s*$", output, re.MULTILINE)
+    prefix = "mpv_" if dll.name == "libmpv-2.dll" else "av_jni_"
+    names = sorted(name for name in names if name.startswith(prefix))
+    if not names:
+        raise RuntimeError(f"No required exports in {dll.name}")
+    definition = scratch / (dll.name + ".def")
+    definition.write_text("LIBRARY " + dll.name + "\nEXPORTS\n" + "\n".join(names) + "\n")
+    import_lib = scratch / (dll.name + ".a")
+    run([compiler_bin / "llvm-dlltool.exe", "-m", "arm64", "-d", definition,
+         "-l", import_lib, "-D", dll.name], env)
+    return import_lib
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-runtime-jar", type=Path, required=True)
     parser.add_argument("--msys2-dir", type=Path, required=True)
     args = parser.parse_args()
-    if platform.system() != "Windows" or platform.machine().lower() not in {"amd64", "x86_64"}:
-        parser.error("This recipe requires native Windows x64 Python and the MSYS2 UCRT64 toolchain.")
-    java_home = os.environ.get("JAVA_HOME")
-    if not java_home:
-        parser.error("Set JAVA_HOME to a Windows x64 JDK (JNI headers are required).")
+    verify_mpv_codec_inputs()
+    arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine().lower())
+    if platform.system() != "Windows" or arch is None:
+        parser.error("Requires native Windows x64/arm64 Python and matching MSYS2 toolchain.")
+    if not os.environ.get("JAVA_HOME"):
+        parser.error("Set JAVA_HOME to a matching Windows JDK.")
+    runtime_target = f"windows-{arch}"
     source_dir = ROOT / "mediamp-mpv/src/cpp"
-    include_dirs = [source_dir / "include", Path(java_home) / "include",
-                    Path(java_home) / "include/win32", ROOT / "mediamp-mpv/mpv/include",
-                    ROOT / "mediamp-ffmpeg/ffmpeg"]
-    required_headers = [include_dirs[1] / "jni.h", include_dirs[2] / "jni_md.h",
-                        include_dirs[3] / "mpv/client.h", include_dirs[4] / "libavcodec/jni.h"]
-    for header in required_headers:
+    java_home = Path(os.environ["JAVA_HOME"])
+    include_dirs = [source_dir / "include", java_home / "include", java_home / "include/win32",
+                    ROOT / "mediamp-mpv/mpv/include", ROOT / "mediamp-ffmpeg/ffmpeg"]
+    for header in (include_dirs[1] / "jni.h", include_dirs[2] / "jni_md.h",
+                   include_dirs[3] / "mpv/client.h", include_dirs[4] / "libavcodec/jni.h"):
         if not header.is_file():
-            parser.error(f"Missing header {header}; initialize submodules and configure JAVA_HOME.")
-    compiler_bin = args.msys2_dir.resolve() / "ucrt64/bin"
-    compiler, objdump = compiler_bin / "g++.exe", compiler_bin / "objdump.exe"
-    for tool in (compiler, objdump):
+            parser.error(f"Missing header {header}; initialize submodules and JAVA_HOME.")
+    compiler_bin = args.msys2_dir.resolve() / ("ucrt64/bin" if arch == "x64" else "clangarm64/bin")
+    compiler = compiler_bin / ("g++.exe" if arch == "x64" else "clang++.exe")
+    objdump = compiler_bin / ("objdump.exe" if arch == "x64" else "llvm-objdump.exe")
+    required_tools = [compiler, objdump]
+    if arch == "arm64":
+        required_tools += [compiler_bin / "llvm-readobj.exe", compiler_bin / "llvm-dlltool.exe"]
+    for tool in required_tools:
         if not tool.is_file():
-            parser.error(f"Missing {tool}; install mingw-w64-ucrt-x86_64-gcc and binutils.")
-    env = dict(os.environ, PATH=str(compiler_bin) + os.pathsep + os.environ.get("PATH", ""))
-    env["LC_ALL"] = "C"
-    target = run([compiler, "-dumpmachine"], env, capture_output=True, text=True).stdout.strip()
-    if target != "x86_64-w64-mingw32":
-        parser.error(f"Expected x86_64-w64-mingw32 compiler, got {target}.")
+            parser.error(f"Missing tool: {tool}")
+    env = dict(os.environ, PATH=str(compiler_bin) + os.pathsep + os.environ.get("PATH", ""), LC_ALL="C")
+    compiler_target = run([compiler, "-dumpmachine"], env, capture_output=True, text=True).stdout.strip()
+    expected = "x86_64-w64-mingw32" if arch == "x64" else "aarch64-w64-windows-gnu"
+    accepted_targets = {expected} if arch == "x64" else {expected, "aarch64-w64-mingw32"}
+    if compiler_target not in accepted_targets:
+        parser.error(f"Unexpected compiler target {compiler_target}; expected {sorted(accepted_targets)}")
     compiler_version = run([compiler, "--version"], env, capture_output=True, text=True).stdout.splitlines()[0]
-    version = next(line.partition("=")[2].strip()
-                   for line in (ROOT / "gradle.properties").read_text().splitlines()
-                   if line.startswith("version.name="))
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*-tao", version):
-        parser.error("version.name must end in -tao to avoid replacing a released runtime.")
+    version = fork_version()
     sources = sorted(source_dir.rglob("*.cpp"))
     if not sources:
-        parser.error(f"No JNI C++ sources found in {source_dir}.")
-    output_dir = ROOT / "mediamp-mpv/build/prebuilt-runtime-jars/windows-x64"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"mediamp-mpv-runtime-{version}-windows-x64.jar"
-    with tempfile.TemporaryDirectory(prefix="mediamp-tao-windows-") as tmp:
+        parser.error(f"No JNI C++ sources in {source_dir}")
+    with tempfile.TemporaryDirectory(prefix=f"mediamp-tao-{runtime_target}-") as tmp:
         scratch = Path(tmp)
         header_patch = ROOT / "mediamp-mpv/render_d3d11.patch"
         include_dirs[3] = prepare_mpv_headers(ROOT / "mediamp-mpv/mpv", header_patch,
                                              scratch / "mpv-headers", env)
         runtime_dir = scratch / "runtime"
         runtime_dir.mkdir()
-        extract_base(args.base_runtime_jar.resolve(), runtime_dir)
+        extract_verified_base(args.base_runtime_jar.resolve(), runtime_dir, "mpv", runtime_target)
+        verify_runtime_manifest(runtime_dir, "mpv", runtime_target)
         library = runtime_dir / "mediampv.dll"
-        old_jni_hash = hashlib.sha256(library.read_bytes()).hexdigest()
-        library.unlink()  # A compiler failure must never leave the upstream JNI as the output.
+        old_jni_hash = sha256(library)
+        library.unlink()
         includes = [arg for directory in include_dirs for arg in ("-I", directory)]
-        compile_flags = ["-std=c++17", "-O2", "-D_WIN32_WINNT=0x0A00",
-                         "-static-libgcc", "-static-libstdc++"]
-        # Put static libstdc++ before winpthread so the latter resolves its thread
-        # references. Keep system DLL imports dynamic after this group.
-        static_runtime = ["-Wl,-Bstatic", "-lstdc++", "-lwinpthread", "-Wl,-Bdynamic"]
-        run([compiler, *compile_flags, "-shared", *includes, *sources,
-             runtime_dir / "libmpv-2.dll", runtime_dir / "avcodec-62.dll",
+        compile_flags = ["-std=c++17", "-O2", "-D_WIN32_WINNT=0x0A00"]
+        if arch == "x64":
+            compile_flags += ["-static-libgcc", "-static-libstdc++"]
+            static_runtime = ["-Wl,-Bstatic", "-lstdc++", "-lwinpthread", "-Wl,-Bdynamic"]
+            codec_links = [runtime_dir / "libmpv-2.dll", runtime_dir / "avcodec-62.dll"]
+            runtime_description = "static GCC/libstdc++/winpthread"
+        else:
+            # CLANGARM64 uses libc++ and compiler-rt, never GCC/libstdc++.
+            compile_flags += ["-static", "-stdlib=libc++", "-fuse-ld=lld"]
+            static_runtime = []
+            codec_links = [make_arm64_import_library(runtime_dir / name, compiler_bin, scratch, env)
+                           for name in ("libmpv-2.dll", "avcodec-62.dll")]
+            runtime_description = "static Clang compiler-rt/libc++/libunwind"
+        run([compiler, *compile_flags, "-shared", *includes, *sources, *codec_links,
              *static_runtime, "-ld3d11", "-ld3d12", "-ldxgi", "-ldxguid",
              "-lwindowscodecs", "-lole32", "-lopengl32", "-lgdi32",
              "-Wl,--no-undefined", "-o", library], env)
-        if hashlib.sha256(library.read_bytes()).hexdigest() == old_jni_hash:
-            raise RuntimeError("Rebuilt JNI is identical to upstream; refusing to label it TAO.")
+        if sha256(library) == old_jni_hash:
+            raise RuntimeError("Refusing unchanged upstream JNI output.")
+        verify_runtime_manifest(runtime_dir, "mpv", runtime_target)
         binary_info = run([objdump, "-p", library], env, capture_output=True, text=True).stdout
-        dependencies = set(re.findall(r"DLL Name:\s*(\S+)", binary_info))
-        if not dependencies or "libmpv-2.dll" not in {name.lower() for name in dependencies}:
-            raise RuntimeError("Could not verify the rebuilt JNI's libmpv dependency.")
-        unexpected = COMPILER_RUNTIME_DLLS & {name.lower() for name in dependencies}
-        if unexpected:
-            raise RuntimeError(f"JNI still imports compiler runtime DLLs: {sorted(unexpected)}")
-        methods = [f"Java_org_openani_mediamp_mpv_MPVHandleDesktop_{method}" for method in TAO_METHODS]
+        dependencies = {name.lower() for name in re.findall(r"DLL Name:\s*(\S+)", binary_info)}
+        if "libmpv-2.dll" not in dependencies:
+            raise RuntimeError("Could not verify rebuilt JNI libmpv dependency.")
+        forbidden = COMPILER_RUNTIME_DLLS | {"libc++.dll", "libunwind.dll", "libc++abi.dll"}
+        if dependencies & forbidden:
+            raise RuntimeError(f"JNI still imports compiler runtime DLLs: {sorted(dependencies & forbidden)}")
+        methods = mpv_jni_exports(compiler, compile_flags, include_dirs, env)
         probe_source = scratch / "load-probe.cpp"
-        probe_source.write_text(LOAD_PROBE.replace("@TAO_METHODS@", ", ".join(f'"{method}"' for method in methods)))
+        probe_source.write_text(LOAD_PROBE.replace("@TAO_METHODS@", ", ".join(f'"{m}"' for m in methods)))
         probe = scratch / "load-probe.exe"
         run([compiler, *compile_flags, "-municode", *includes, probe_source,
              *static_runtime, "-o", probe], env)
-        # Hide the build tools from the probe to catch missing packaged dependencies.
+        verify_binary_arch(probe, runtime_target)
         probe_env = dict(env, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
         run([probe, library], probe_env, cwd=scratch)
-        source_hash = hashlib.sha256()
-        for path in sorted(source_dir.rglob("*")):
-            if path.is_file():
-                source_hash.update(path.relative_to(source_dir).as_posix().encode())
-                source_hash.update(path.read_bytes())
-        provenance = runtime_dir / "META-INF/mediamp-tao-native-build.txt"
-        provenance.parent.mkdir(exist_ok=True)
-        provenance.write_text(
-            f"version={version}\nbase-runtime={BASE_VERSION}\nbase-sha256={BASE_SHA256}\n"
-            f"jni-source-sha256={source_hash.hexdigest()}\ncompiler={compiler_version}\n"
-            f"mpv-header-patch-sha256={hashlib.sha256(header_patch.read_bytes()).hexdigest()}\n"
-            "compiler-runtime=static GCC/libstdc++/winpthread\n"
-            "codecs=upstream prebuilt; JNI=compiled from this checkout\n"
-            "verification=restricted DLL loading; 5 TAO JNI exports; headless mpv initialization\n"
-            "gpu-playback=not verified by this build script\n"
-        )
-        staged = scratch / output.name
-        with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in sorted(runtime_dir.rglob("*")):
-                if path.is_file():
-                    archive.write(path, path.relative_to(runtime_dir).as_posix())
-        # Copy only after every build/load check succeeds; never emit a partial JAR.
-        pending = output.with_suffix(".jar.tmp")
-        pending.write_bytes(staged.read_bytes())
-        pending.replace(output)
-    print(output)
+        write_provenance(runtime_dir, "mpv", runtime_target, version, **{
+            "jni": "compiled-from-checkout", "jni-source-sha256": tree_hash(source_dir),
+            "jni-binary-sha256": sha256(library), "compiler": compiler_version,
+            "mpv-header-patch-sha256": sha256(header_patch), "compiler-runtime": runtime_description,
+            "codecs": "upstream prebuilt unchanged", "tao": "D3D11 shared texture",
+            "verification": "native architecture; restricted DLL loading; all JNI exports; headless mpv initialization",
+            "gpu-playback": "not verified by this build script",
+        })
+        package_runtime(runtime_dir, "mpv", runtime_target, version)
 
 
 if __name__ == "__main__":

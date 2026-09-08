@@ -8,6 +8,9 @@
 
 import org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension
 import org.jetbrains.kotlin.gradle.dsl.kotlinExtension
+import groovy.json.JsonSlurper
+import org.gradle.api.publish.PublishingExtension
+import org.gradle.api.publish.maven.MavenPublication
 
 buildscript {
     repositories {
@@ -64,16 +67,53 @@ idea {
     }
 }
 
-// Freeze the complete desktop dependency closure before attempting either registry.
-// Deliberately omit the all-platform aggregator: this release includes these two native targets.
-tasks.register("stageTaoDesktopRelease") {
-    group = "publishing"
-    description = "Stage the TAO JVM libraries and macOS arm64 / Windows x64 runtimes"
-    listOf("mediamp-api", "mediamp-internal-utils", "mediamp-native-loader", "mediamp-mpv").forEach { module ->
-        dependsOn(":$module:publishKotlinMultiplatformPublicationToMavenLocal")
-        dependsOn(":$module:publishDesktopPublicationToMavenLocal")
+// The same checked-in inventory is consumed by the release verifier. Missing
+// native targets must fail here, before a partial release can reach a registry.
+@Suppress("UNCHECKED_CAST")
+val fullReleaseInventory = JsonSlurper().parse(file("scripts/tao-publications.json")) as Map<String, Any?>
+val fullReleaseExpected = buildSet {
+    (fullReleaseInventory.getValue("multiplatform") as Map<*, *>).forEach { (module, targets) ->
+        add(module.toString())
+        (targets as List<*>).forEach { add("$module-$it") }
     }
-    dependsOn(":mediamp-mpv-tao:publishMavenPublicationToMavenLocal")
-    dependsOn(":mediamp-mpv:publishMpvRuntimeMacosArm64PublicationToMavenLocal")
-    dependsOn(":mediamp-mpv:publishMpvRuntimeWindowsX64PublicationToMavenLocal")
+    (fullReleaseInventory.getValue("standalone") as Map<*, *>).keys.forEach { add(it.toString()) }
+    (fullReleaseInventory.getValue("nativeFamilies") as List<*>).forEach { family ->
+        add("mediamp-$family-runtime")
+        (fullReleaseInventory.getValue("nativePlatforms") as List<*>).forEach {
+            add("mediamp-$family-runtime-$it")
+        }
+    }
+    add(fullReleaseInventory.getValue("xcframework").toString())
+}
+val stageTaoFullRelease = tasks.register("stageTaoFullRelease") {
+    group = "publishing"
+    description = "Stage all 65 MediaMP publications, including mobile and every native runtime"
+}
+gradle.projectsEvaluated {
+    val publications = subprojects.flatMap { module ->
+        module.extensions.findByType<PublishingExtension>()?.publications
+            ?.withType<MavenPublication>()?.map { module to it }.orEmpty()
+    }
+    val validate = tasks.register("validateTaoFullReleasePublications") {
+        doLast {
+            val actual = publications.map { it.second.artifactId }
+            check(actual.size == actual.toSet().size) { "Duplicate Maven coordinates in release" }
+            check(actual.toSet() == fullReleaseExpected) {
+                "Incomplete release publications. Missing: ${fullReleaseExpected - actual.toSet()}; " +
+                    "unexpected: ${actual.toSet() - fullReleaseExpected}"
+            }
+            check(publications.all { (_, publication) ->
+                publication.groupId == fullReleaseInventory.getValue("group") && publication.version == project.version.toString()
+            }) { "Every publication must use the fork namespace and the single release version" }
+        }
+    }
+    stageTaoFullRelease.configure {
+        dependsOn(validate)
+        publications.forEach { (module, publication) ->
+            val taskName = "publish${publication.name.replaceFirstChar { it.uppercase() }}PublicationToMavenLocal"
+            val publishTask = module.tasks.named(taskName)
+            publishTask.configure { mustRunAfter(validate) }
+            dependsOn(publishTask)
+        }
+    }
 }

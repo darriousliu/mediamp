@@ -5,6 +5,7 @@ build/
 !**/src/test/**/build/
 local.properties
 .kotlin/
+__pycache__/
 **/test-sandbox/
 
 # Local source files

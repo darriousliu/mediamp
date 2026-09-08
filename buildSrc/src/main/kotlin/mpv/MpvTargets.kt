@@ -501,6 +501,8 @@ internal fun MpvBuildContext.androidTarget(abi: AndroidAbi): MpvBuildTarget {
             "-Dopensles=enabled",
             "-Daaudio=disabled",
             "-Dandroid-media-ndk=enabled",
+            // Android artifacts need the library, not host gtk-doc/DocBook tooling.
+            "-Dharfbuzz:docs=disabled",
             "-Dlibass:require-system-font-provider=false",
             "-Dlibplacebo:vulkan=disabled",
             "-Dlibplacebo:lcms=disabled",
