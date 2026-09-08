@@ -71,6 +71,16 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "Incomplete staging"):
             self.freeze()
 
+    def test_windows_crlf_native_provenance_is_accepted(self):
+        artifact = "mediamp-mpv-runtime-windows-x64"
+        path = self.staging / release.GROUP_PATH / artifact / VERSION / (artifact + "-" + VERSION + ".jar")
+        with zipfile.ZipFile(path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        name = "META-INF/mediamp-tao-native-build.txt"
+        contents[name] = contents[name].replace(b"\n", b"\r\n")
+        path.write_bytes(jar(contents))
+        self.assertEqual(len(self.freeze()["coordinates"]), 11)
+
     def test_unpublished_same_group_dependency_cannot_freeze(self):
         path = self.staging / release.GROUP_PATH / "mediamp-mpv-tao" / VERSION / ("mediamp-mpv-tao-" + VERSION + ".pom")
         path.write_text(path.read_text().replace("</project>", "<dependencies><dependency>"

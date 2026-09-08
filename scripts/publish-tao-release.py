@@ -151,10 +151,14 @@ def freeze(staging, output, version, platforms):
                     if archive.testzip() is not None:
                         raise ReleaseError(f"Corrupt JAR: {path.name}")
                     if artifact.startswith("mediamp-mpv-runtime-") and path.name == prefix + ".jar":
-                        provenance = archive.read("META-INF/mediamp-tao-native-build.txt").decode()
-                        if f"version={version}\n" not in provenance or "base-runtime=0.4.0\n" not in provenance:
+                        provenance = dict(
+                            line.split("=", 1)
+                            for line in archive.read("META-INF/mediamp-tao-native-build.txt").decode().splitlines()
+                            if "=" in line
+                        )
+                        if provenance.get("version") != version or provenance.get("base-runtime") != "0.4.0":
                             raise ReleaseError(f"Unverified native runtime provenance: {artifact}")
-                        if f"jni-source-sha256={expected_jni_hash}\n" not in provenance:
+                        if provenance.get("jni-source-sha256") != expected_jni_hash:
                             raise ReleaseError(f"Native runtime does not match this checkout's JNI source: {artifact}")
                         platform = artifact.removeprefix("mediamp-mpv-runtime-")
                         if f"mpv-natives-{platform}.txt" not in archive.namelist():
