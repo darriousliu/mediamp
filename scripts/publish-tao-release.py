@@ -100,7 +100,7 @@ def required_suffixes(kind):
         required.add(".module")
     if kind != "catalog":
         required.add("-javadoc.jar")
-    if kind in ("metadata", "jvm", "android", "native", "wasm"):
+    if kind in ("metadata", "jvm", "android", "native", "wasm", "runtime"):
         required.add("-sources.jar")
     return required
 

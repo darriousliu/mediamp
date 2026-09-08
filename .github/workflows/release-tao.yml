@@ -94,6 +94,8 @@ jobs:
     needs: desktop-native
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      MESON_PACKAGE_CACHE_DIR: ${{ github.workspace }}/build/meson-package-cache
     steps:
       - uses: actions/checkout@v4
         with:

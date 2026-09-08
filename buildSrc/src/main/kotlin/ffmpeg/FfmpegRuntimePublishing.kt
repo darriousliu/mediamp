@@ -130,6 +130,15 @@ internal fun configureRuntimePublishing(
 ) {
     val deployVersion = context.project.version.toString()
     val runtimeTargets = context.desktopRuntimeTargets
+    val runtimeSources = context.project.tasks.register<Jar>("ffmpegRuntimeSourcesJar") {
+        archiveBaseName.set("mediamp-ffmpeg-runtime")
+        archiveClassifier.set("sources")
+        from(context.project.layout.projectDirectory.dir("src/jvmMain/c")) { into("src/jvmMain/c") }
+        from(context.project.layout.projectDirectory.dir("src/appleMain/c")) { into("src/appleMain/c") }
+        from(context.project.layout.projectDirectory.dir("src/appleMain/include")) { into("src/appleMain/include") }
+        from(context.project.layout.projectDirectory.dir("src/nativeInterop")) { into("src/nativeInterop") }
+        from(context.project.rootProject.file("LICENSE"))
+    }
 
     context.project.extensions.getByType<com.vanniktech.maven.publish.MavenPublishBaseExtension>().apply {
         configure(KotlinMultiplatform(JavadocJar.Empty(), SourcesJar.Sources(), listOf("debug", "release")))
@@ -149,6 +158,7 @@ internal fun configureRuntimePublishing(
                     classifier = null
                     jarTask.builtBy?.let { builtBy(it) }
                 }
+                artifact(runtimeSources)
 
                 addCompilePomDependency(
                     groupId = context.project.group.toString(),

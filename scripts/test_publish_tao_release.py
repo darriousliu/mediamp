@@ -166,6 +166,11 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "Incomplete staging"):
             self.freeze()
 
+    def test_runtime_missing_sources_cannot_freeze(self):
+        self.file("mediamp-ffmpeg-runtime-macos-arm64", "-sources.jar").unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "Incomplete staging.*sources.jar"):
+            self.freeze()
+
     def test_broken_available_at_cannot_freeze(self):
         path = self.file("mediamp-api", ".module")
         module = json.loads(path.read_text())
